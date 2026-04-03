@@ -2,10 +2,23 @@ const express   = require('express');
 const http      = require('http');
 const { Server } = require('socket.io');
 const cors      = require('cors');
-// Stripe — remplace par ta clé secrète depuis le dashboard Stripe
+const { createClient } = require('@supabase/supabase-js');
 // Chargement des variables d'environnement depuis .env
 try { require('dotenv').config(); } catch(e) {}
 const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;
+
+// Supabase — questions FR
+const supa = createClient(
+  'https://gqjcmjncyhcioxvjkasc.supabase.co',
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdxamNtam5jeWhjaW94dmprYXNjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3NjQ4NjksImV4cCI6MjA4OTM0MDg2OX0.wvpLAEkUKHlcV1Js4ZDjT91u9RCRIL60EKGNwH8RjYA'
+);
+
+const CAT_MAP = {
+  '9':'General Knowledge','10':'Entertainment: Books','11':'Entertainment: Film',
+  '12':'Entertainment: Music','14':'Entertainment: Television','15':'Entertainment: Video Games',
+  '17':'Science & Nature','18':'Science: Computers','21':'Sports','22':'Geography',
+  '23':'History','25':'Art','27':'Animals','31':'Entertainment: Japanese Anime & Manga',
+};
 let stripe;
 try { stripe = require('stripe')(STRIPE_SECRET); } catch(e) { console.warn('Stripe not installed. Run: npm install stripe'); }
 
@@ -109,10 +122,48 @@ const players = {};  // socketId → { code, name, avatar }
 // }
 
 // ══════════════════════════════════════════
-//  FETCH QUESTIONS depuis OpenTDB
+//  FETCH QUESTIONS — Supabase FR (priorité) + OpenTDB EN (fallback)
 // ══════════════════════════════════════════
 async function fetchQuestions(nb, category, difficulty) {
   nb = Math.max(1, Math.min(50, parseInt(nb) || 10));
+
+  // ── Tentative 1 : Supabase FR ──
+  try {
+    const catName = (category && category !== '0') ? (CAT_MAP[String(category)] || category) : null;
+    let query = supa.from('translated_questions')
+      .select('category, question_fr, answers_fr, correct_index')
+      .not('question_fr', 'is', null);
+    if (catName) query = query.ilike('category', '%' + catName + '%');
+    if (difficulty && ['easy','medium','hard'].includes(difficulty)) query = query.eq('difficulty', difficulty);
+
+    const offset = Math.floor(Math.random() * 500);
+    const { data } = await query.range(offset, offset + nb * 5 - 1);
+
+    if (data && data.length >= nb) {
+      return shuffle(data).slice(0, nb).map(q => ({
+        cat:     q.category || 'Culture générale',
+        q:       q.question_fr.trim(),
+        answers: q.answers_fr,
+        correct: q.correct_index
+      }));
+    }
+
+    // Tentative sans filtres
+    const { data: d2 } = await supa.from('translated_questions')
+      .select('category, question_fr, answers_fr, correct_index')
+      .not('question_fr', 'is', null)
+      .limit(nb * 5);
+    if (d2 && d2.length >= nb) {
+      return shuffle(d2).slice(0, nb).map(q => ({
+        cat: q.category || 'Culture générale', q: q.question_fr.trim(),
+        answers: q.answers_fr, correct: q.correct_index
+      }));
+    }
+  } catch(e) {
+    console.warn('Supabase fetch error, falling back to OpenTDB:', e.message);
+  }
+
+  // ── Fallback : OpenTDB EN ──
   let url = `https://opentdb.com/api.php?amount=${nb}&type=multiple`;
   if (category && category !== '0') url += `&category=${encodeURIComponent(category)}`;
   if (difficulty && ['easy','medium','hard'].includes(difficulty)) url += `&difficulty=${difficulty}`;
