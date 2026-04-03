@@ -11,23 +11,33 @@ try { stripe = require('stripe')(STRIPE_SECRET); } catch(e) { console.warn('Stri
 
 const app    = express();
 const server = http.createServer(app);
+const ALLOWED_ORIGINS = [
+  'https://brainbattle-client.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+];
 const io     = new Server(server, {
-  cors: { origin: '*', methods: ['GET','POST'] }
+  cors: { origin: ALLOWED_ORIGINS, methods: ['GET','POST'] }
 });
 
-app.use(cors());
+app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json());
 app.get('/', (req, res) => res.send('BrainBattle Server ✅'));
-app.use(express.json());
 
 // ── STRIPE PRODUCTS ──
 const STRIPE_PRODUCTS = {
-  pass_monthly: { name: 'BrainBattle Pass Mensuel', price: 299,   mode: 'subscription', interval: 'month' },
-  pass_yearly:  { name: 'BrainBattle Pass Annuel',  price: 1999,  mode: 'subscription', interval: 'year'  },
-  xp_boost_24h: { name: 'Boost XP 24h',             price: 99,    mode: 'payment' },
-  xp_boost_7d:  { name: 'Boost XP 7 jours',         price: 299,   mode: 'payment' },
-  pack_starter: { name: 'Pack Cosmétiques Starter',  price: 199,   mode: 'payment' },
-  pack_premium: { name: 'Pack Cosmétiques Premium',  price: 499,   mode: 'payment' },
+  // Abonnements
+  pass_monthly:           { name: 'BrainBattle Pass Mensuel',    price: 299,  mode: 'subscription', interval: 'month' },
+  pass_yearly:            { name: 'BrainBattle Pass Annuel',     price: 1999, mode: 'subscription', interval: 'year'  },
+  // Avatars exclusifs boutique
+  avatar_shadow_samurai:  { name: 'Avatar Samouraï des Ombres',  price: 99,   mode: 'payment' },
+  avatar_twilight_assassin:{ name: 'Avatar Assassin du Crépuscule', price: 99, mode: 'payment' },
+  avatar_anubis:          { name: 'Avatar Anubis',               price: 99,   mode: 'payment' },
+  avatar_fenrir:          { name: 'Avatar Fenrir',               price: 99,   mode: 'payment' },
+  // Musiques exclusives boutique
+  music_new_world:        { name: 'Musique Nouveau Monde',       price: 99,   mode: 'payment' },
+  music_celebration:      { name: 'Musique Célébration',         price: 99,   mode: 'payment' },
 };
 
 // ── STRIPE CHECKOUT ──
@@ -75,7 +85,12 @@ function genCode() {
 }
 
 function shuffle(arr) {
-  return [...arr].sort(() => Math.random() - 0.5);
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
 // ══════════════════════════════════════════
@@ -97,21 +112,28 @@ const players = {};  // socketId → { code, name, avatar }
 //  FETCH QUESTIONS depuis OpenTDB
 // ══════════════════════════════════════════
 async function fetchQuestions(nb, category, difficulty) {
+  nb = Math.max(1, Math.min(50, parseInt(nb) || 10));
   let url = `https://opentdb.com/api.php?amount=${nb}&type=multiple`;
-  if (category && category !== '0') url += `&category=${category}`;
-  if (difficulty) url += `&difficulty=${difficulty}`;
-  const res  = await fetch(url);
-  const data = await res.json();
-  if (data.response_code !== 0) throw new Error('Pas assez de questions.');
-  return data.results.map(q => {
-    const answers = shuffle([...q.incorrect_answers, q.correct_answer]);
-    return {
-      cat:     decodeHTMLEntities(q.category),
-      q:       decodeHTMLEntities(q.question),
-      answers: answers.map(a => decodeHTMLEntities(a)),
-      correct: answers.indexOf(q.correct_answer)
-    };
-  });
+  if (category && category !== '0') url += `&category=${encodeURIComponent(category)}`;
+  if (difficulty && ['easy','medium','hard'].includes(difficulty)) url += `&difficulty=${difficulty}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res  = await fetch(url, { signal: controller.signal });
+    const data = await res.json();
+    if (data.response_code !== 0) throw new Error('Pas assez de questions.');
+    return data.results.map(q => {
+      const answers = shuffle([...q.incorrect_answers, q.correct_answer]);
+      return {
+        cat:     decodeHTMLEntities(q.category),
+        q:       decodeHTMLEntities(q.question),
+        answers: answers.map(a => decodeHTMLEntities(a)),
+        correct: answers.indexOf(q.correct_answer)
+      };
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function decodeHTMLEntities(str) {
@@ -252,10 +274,10 @@ io.on('connection', (socket) => {
     }
     // Chrono: score based on correctness + combo
     if (room.mode === 'chrono') {
+      player.answered = (player.answered || 0) + 1;
       if (correct) {
         player.combo = (player.combo || 0) + 1;
         player.correct = (player.correct || 0) + 1;
-        // Combo bonus
         let comboBonus = 0;
         if (player.combo >= 10) comboBonus = 100;
         else if (player.combo >= 5) comboBonus = 50;
@@ -263,20 +285,15 @@ io.on('connection', (socket) => {
         const chronoPts = 100 + comboBonus;
         player.chronoScore = (player.chronoScore || 0) + chronoPts;
         player.score = player.chronoScore;
-        // Send next question to this player
         socket.emit('chrono_result', { correct: true, combo: player.combo, points: chronoPts, score: player.chronoScore });
-        sendChronoQuestion(code, socket.id, io);
       } else {
-        player.combo = 0; // reset combo
-        player.answered = (player.answered || 0) + 1;
+        player.combo = 0;
         socket.emit('chrono_result', { correct: false, combo: 0, points: 0, score: player.chronoScore || 0 });
-        sendChronoQuestion(code, socket.id, io);
       }
-      player.answered = (player.answered || 0) + 1;
-      // Broadcast scores
+      sendChronoQuestion(code, socket.id, io);
       const scores = Object.entries(room.players).map(([id, p]) => ({ id, name: p.name, avatar: p.avatar, score: p.chronoScore || 0, combo: p.combo || 0 })).sort((a,b) => b.score - a.score);
       io.to(code).emit('chrono_scores_update', { scores });
-      return; // Don't process normal answer flow
+      return;
     }
     // Battle royale: lose a life on wrong answer
     if (room.mode === 'royale' && !correct) {
@@ -342,7 +359,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('private_msg', ({ toUserId, content, fromUsername, fromAvatar }) => {
-    if (!content || content.length > 200) return;
+    if (!content || typeof content !== 'string' || !content.trim() || content.length > 200) return;
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
         s.emit('private_msg_received', { content, fromUsername, fromAvatar, fromUserId: socket.userId });
@@ -362,7 +379,7 @@ io.on('connection', (socket) => {
 
   // Chat
   socket.on('chat_msg', ({ code, name, msg }) => {
-    if (!msg || msg.length > 120) return;
+    if (!msg || typeof msg !== 'string' || !msg.trim() || msg.length > 120) return;
     // Broadcast to everyone else in the room
     socket.to(code).emit('chat_msg', { name, msg });
   });
@@ -374,6 +391,14 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     if (socket.userId) socket.broadcast.emit('friend_offline', { userId: socket.userId });
+    // Clean up matchmaking queues
+    Object.keys(mmQueues).forEach(m => {
+      const idx = mmQueues[m].findIndex(q => q.socketId === socket.id);
+      if (idx !== -1) mmQueues[m].splice(idx, 1);
+    });
+    // Clean up team queue
+    const tIdx = teamQueue.findIndex(q => q.socketId === socket.id);
+    if (tIdx !== -1) teamQueue.splice(tIdx, 1);
     const pdata = players[socket.id];
     if (pdata) {
       const room = rooms[pdata.code];
@@ -420,18 +445,93 @@ io.on('connection', (socket) => {
   socket.on('host_config', ({ code, mode, category, difficulty, maxQ, timer }) => {
     const room = rooms[code];
     if (!room || room.host !== socket.id) return;
-    if (mode)       room.mode       = mode;
-    if (category)   room.category   = category;
-    if (difficulty !== undefined) room.difficulty = difficulty;
-    if (maxQ)       room.maxQ       = maxQ;
-    if (timer)      room.timer_sec  = timer;
-    // Broadcast updated config to all players
-    io.to(code).emit('host_config_updated', { mode, category, difficulty, maxQ, timer });
-    console.log(`⚙️ Config salon ${code}: mode=${mode} cat=${category} diff=${difficulty} nb=${maxQ} timer=${timer}`);
+    const validModes = ['friends','royale','team','chrono','tactical'];
+    const validDiffs = ['','easy','medium','hard'];
+    if (mode && validModes.includes(mode))       room.mode       = mode;
+    if (category)   room.category   = String(category).slice(0, 10);
+    if (validDiffs.includes(difficulty)) room.difficulty = difficulty;
+    if (maxQ) room.maxQ = Math.max(1, Math.min(50, parseInt(maxQ) || 10));
+    if (timer) room.timer_sec = Math.max(5, Math.min(60, parseInt(timer) || 20));
+    io.to(code).emit('host_config_updated', { mode: room.mode, category: room.category, difficulty: room.difficulty, maxQ: room.maxQ, timer: room.timer_sec });
+    console.log(`⚙️ Config salon ${code}: mode=${room.mode} cat=${room.category} diff=${room.difficulty} nb=${room.maxQ} timer=${room.timer_sec}`);
   });
 
   // ── TACTICAL EVENTS ──
   registerTacticalEvents(socket, io);
+
+  // ── MATCHMAKING ──
+  socket.on('join_matchmaking', ({ mode, name, avatar, userId, groupCode, elo }) => {
+    const data = { socketId:socket.id, name, avatar, userId, groupCode, elo:elo||1, mode, joinedAt: Date.now() };
+    Object.keys(mmQueues).forEach(m => {
+      const idx = mmQueues[m].findIndex(q=>q.socketId===socket.id);
+      if(idx!==-1) mmQueues[m].splice(idx,1);
+    });
+    if(!mmQueues[mode]) mmQueues[mode]=[];
+    mmQueues[mode].push(data);
+    if(groupCode){ if(!mmGroups[groupCode]) mmGroups[groupCode]=[]; mmGroups[groupCode].push(data); }
+    console.log(`🔍 MM [${mode}]: ${name} (${mmQueues[mode].length} waiting)`);
+    tryMatchmaking(mode, io);
+  });
+
+  socket.on('join_matchmade_room', ({ code }) => {
+    const room = rooms[code];
+    if(!room) return;
+    if(!room.players[socket.id]) room.players[socket.id]={name:'Joueur',avatar:'🎮',score:0,lives:3,alive:true};
+    players[socket.id]={code,name:room.players[socket.id].name};
+    socket.join(code);
+    io.to(code).emit('player_joined',{room:sanitizeRoom(room)});
+  });
+
+  // Pre-lobby group management
+  socket.on('register_group', ({ groupCode, name, avatar, userId }) => {
+    if (!mmGroups[groupCode]) mmGroups[groupCode] = [];
+    mmGroups[groupCode] = mmGroups[groupCode].filter(p => p.socketId !== socket.id);
+    mmGroups[groupCode].push({ socketId: socket.id, name, avatar, userId });
+    socket.join('grp-' + groupCode);
+    console.log(`👥 Groupe ${groupCode}: ${name} enregistré`);
+  });
+
+  socket.on('group_mode_change', ({ groupCode, mode }) => {
+    socket.to('grp-' + groupCode).emit('mm_mode_changed', { mode });
+    console.log(`🔄 Groupe ${groupCode}: mode → ${mode}`);
+  });
+
+  socket.on('leave_group', ({ groupCode }) => {
+    if (groupCode && mmGroups[groupCode]) {
+      mmGroups[groupCode] = mmGroups[groupCode].filter(p => p.socketId !== socket.id);
+    }
+    socket.leave('grp-' + groupCode);
+  });
+
+  socket.on('join_group', ({ groupCode, name, avatar, userId }) => {
+    if (!mmGroups[groupCode]) { socket.emit('error', { msg: 'Groupe introuvable.' }); return; }
+    mmGroups[groupCode].push({ socketId: socket.id, name, avatar, userId });
+    socket.join('grp-' + groupCode);
+    io.to('grp-' + groupCode).emit('mm_group_joined', { name, avatar });
+    socket.emit('mm_group_joined', { name: 'toi', avatar });
+    console.log(`👤 ${name} a rejoint le groupe ${groupCode}`);
+  });
+
+  socket.on('leave_matchmaking', ({ mode }) => {
+    if(mode&&mmQueues[mode]){
+      const idx=mmQueues[mode].findIndex(q=>q.socketId===socket.id);
+      if(idx!==-1) mmQueues[mode].splice(idx,1);
+    }
+  });
+
+  // ── TEAM RANKED MATCHMAKING ──
+  socket.on('find_team_match', (data) => {
+    const existing = teamQueue.findIndex(q => q.teamId === data.teamId);
+    if (existing !== -1) teamQueue.splice(existing, 1);
+    teamQueue.push({ socketId: socket.id, ...data });
+    console.log(`🔍 Matchmaking: ${data.teamName} [ELO: ${data.elo}] - Queue: ${teamQueue.length}`);
+    tryMatchTeams(io);
+  });
+
+  socket.on('cancel_team_match', () => {
+    const idx = teamQueue.findIndex(q => q.socketId === socket.id);
+    if (idx !== -1) { teamQueue.splice(idx, 1); console.log('❌ Matchmaking annulé'); }
+  });
 });
 
 // ══════════════════════════════════════════
@@ -513,7 +613,7 @@ function endGame(code) {
   room.status = 'results';
   clearTimeout(room.timer);
 
-  const ranking = Object.entries(room.players)
+  let ranking = Object.entries(room.players)
     .map(([id, p]) => ({ id, name: p.name, avatar: p.avatar, score: p.score, alive: p.alive, team: p.team }))
     .sort((a, b) => b.score - a.score);
 
@@ -522,7 +622,6 @@ function endGame(code) {
   if ((room.mode === 'team' || room.mode === 'team_ranked') && room.teamScores) {
     const winner = room.teamScores.A > room.teamScores.B ? 'A' : room.teamScores.B > room.teamScores.A ? 'B' : 'Égalité';
     teamResult = { scores: room.teamScores, winner };
-    // Add individual player ELO delta info for ranked
     if (room.mode === 'team_ranked') {
       ranking.forEach(p => {
         const player = room.players[p.id];
@@ -535,8 +634,9 @@ function endGame(code) {
 
   // Chrono: rank by chrono score
   if (room.mode === 'chrono') {
-    ranking.sort((a,b) => (room.players[b.id]?.chronoScore||0) - (room.players[a.id]?.chronoScore||0));
-    ranking = ranking.map(r => ({ ...r, score: room.players[r.id]?.chronoScore || 0 }));
+    ranking = ranking
+      .map(r => ({ ...r, score: room.players[r.id]?.chronoScore || 0 }))
+      .sort((a, b) => b.score - a.score);
   }
 
   io.to(code).emit('game_over', { ranking, teamResult, mode: room.mode });
@@ -578,71 +678,6 @@ function sanitizePlayers(players) {
 const mmQueues = { duel1v1:[], royale:[], team:[], tactical:[], chrono:[] };
 const mmGroups = {};
 
-io.on('connection', (socket) => {
-  socket.on('join_matchmaking', ({ mode, name, avatar, userId, groupCode, elo }) => {
-    const data = { socketId:socket.id, name, avatar, userId, groupCode, elo:elo||1, mode };
-    Object.keys(mmQueues).forEach(m => {
-      const idx = mmQueues[m].findIndex(q=>q.socketId===socket.id);
-      if(idx!==-1) mmQueues[m].splice(idx,1);
-    });
-    if(!mmQueues[mode]) mmQueues[mode]=[];
-    const joinedAt = Date.now();
-    mmQueues[mode].push(data);
-    if(groupCode){ if(!mmGroups[groupCode]) mmGroups[groupCode]=[]; mmGroups[groupCode].push(data); }
-    console.log(`🔍 MM [${mode}]: ${name} (${mmQueues[mode].length} waiting)`);
-    tryMatchmaking(mode, io);
-  });
-
-  socket.on('join_matchmade_room', ({ code }) => {
-    const room = rooms[code];
-    if(!room) return;
-    if(!room.players[socket.id]) room.players[socket.id]={name:'Joueur',avatar:'🎮',score:0,lives:3,alive:true};
-    players[socket.id]={code,name:room.players[socket.id].name};
-    socket.join(code);
-    io.to(code).emit('player_joined',{room:sanitizeRoom(room)});
-  });
-
-  // Pre-lobby group management
-  socket.on('register_group', ({ groupCode, name, avatar, userId }) => {
-    if (!mmGroups[groupCode]) mmGroups[groupCode] = [];
-    mmGroups[groupCode] = mmGroups[groupCode].filter(p => p.socketId !== socket.id);
-    mmGroups[groupCode].push({ socketId: socket.id, name, avatar, userId });
-    socket.join('grp-' + groupCode);
-    console.log(`👥 Groupe ${groupCode}: ${name} enregistré`);
-  });
-
-  socket.on('group_mode_change', ({ groupCode, mode }) => {
-    // Notify all group members except sender
-    socket.to('grp-' + groupCode).emit('mm_mode_changed', { mode });
-    console.log(`🔄 Groupe ${groupCode}: mode → ${mode}`);
-  });
-
-  socket.on('leave_group', ({ groupCode }) => {
-    if (groupCode && mmGroups[groupCode]) {
-      mmGroups[groupCode] = mmGroups[groupCode].filter(p => p.socketId !== socket.id);
-    }
-    socket.leave('grp-' + groupCode);
-  });
-
-  // Handle friend joining group via code
-  socket.on('join_group', ({ groupCode, name, avatar, userId }) => {
-    if (!mmGroups[groupCode]) { socket.emit('error', { msg: 'Groupe introuvable.' }); return; }
-    mmGroups[groupCode].push({ socketId: socket.id, name, avatar, userId });
-    socket.join('grp-' + groupCode);
-    // Notify group
-    io.to('grp-' + groupCode).emit('mm_group_joined', { name, avatar });
-    // Send current mode to newcomer
-    socket.emit('mm_group_joined', { name: 'toi', avatar });
-    console.log(`👤 ${name} a rejoint le groupe ${groupCode}`);
-  });
-
-  socket.on('leave_matchmaking', ({ mode }) => {
-    if(mode&&mmQueues[mode]){
-      const idx=mmQueues[mode].findIndex(q=>q.socketId===socket.id);
-      if(idx!==-1) mmQueues[mode].splice(idx,1);
-    }
-  });
-});
 
 function tryMatchmaking(mode, io) {
   const queue = mmQueues[mode]||[];
@@ -699,27 +734,6 @@ server.listen(PORT, () => {
 // ══════════════════════════════════════════
 const teamQueue = []; // { socketId, teamId, teamName, teamTag, elo, userId, userName }
 
-io.on('connection', (socket) => {
-  // already handled above, but add team events here
-});
-
-// Re-register team matchmaking on each connection
-const origOn = io.on.bind(io);
-io.on('connection', (socket) => {
-
-  socket.on('find_team_match', (data) => {
-    const existing = teamQueue.findIndex(q => q.teamId === data.teamId);
-    if (existing !== -1) teamQueue.splice(existing, 1);
-    teamQueue.push({ socketId: socket.id, ...data });
-    console.log(`🔍 Matchmaking: ${data.teamName} [ELO: ${data.elo}] - Queue: ${teamQueue.length}`);
-    tryMatchTeams(io);
-  });
-
-  socket.on('cancel_team_match', () => {
-    const idx = teamQueue.findIndex(q => q.socketId === socket.id);
-    if (idx !== -1) { teamQueue.splice(idx, 1); console.log('❌ Matchmaking annulé'); }
-  });
-});
 
 function tryMatchTeams(io) {
   if (teamQueue.length < 2) return;
@@ -883,10 +897,10 @@ async function startTacticalRound(code, io) {
   try {
     const qs = await fetchQuestions(1, '0', diff === 'easy' ? 'easy' : diff === 'medium' ? 'medium' : 'hard');
     question = qs[0] ? {
-      q:       qs[0].question || qs[0].q,
-      answers: qs[0].answers  || qs[0].incorrect_answers?.concat(qs[0].correct_answer),
-      correct: qs[0].correct  || 0,
-      cat:     qs[0].category || qs[0].cat || 'Culture générale',
+      q:       qs[0].q,
+      answers: qs[0].answers,
+      correct: qs[0].correct,
+      cat:     qs[0].cat || 'Culture générale',
       diff,
     } : null;
   } catch(e) { question = null; }
