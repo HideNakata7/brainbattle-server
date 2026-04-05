@@ -35,8 +35,87 @@ const io     = new Server(server, {
 });
 
 app.use(cors({ origin: ALLOWED_ORIGINS }));
+
+// Stripe webhook needs raw body — must be BEFORE express.json()
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) { res.status(500).send('Webhook not configured'); return; }
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch(e) {
+    console.error('⚠️ Webhook signature failed:', e.message);
+    return res.status(400).send('Webhook Error: ' + e.message);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const { userId, product } = session.metadata || {};
+    if (!userId || !product) { res.json({ received: true }); return; }
+
+    console.log('💰 Payment confirmed:', product, 'for user', userId);
+
+    // Calculate expiry for subscriptions
+    let expiresAt = null;
+    if (product === 'pass_monthly') {
+      expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    } else if (product === 'pass_yearly') {
+      expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    // Store in Supabase
+    try {
+      const { error } = await supa.from('purchases').insert({
+        user_id: userId,
+        product: product,
+        stripe_session_id: session.id,
+        status: 'completed',
+        expires_at: expiresAt
+      });
+      if (error) console.error('Supabase insert error:', error.message);
+      else console.log('✅ Purchase saved to DB:', product);
+    } catch(e) {
+      console.error('DB error:', e.message);
+    }
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
 app.get('/', (req, res) => res.send('Mind Impact Server ✅'));
+
+// ── VERIFY PURCHASES ──
+app.get('/api/purchases/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) { res.status(400).json({ error: 'Missing userId' }); return; }
+
+    const { data, error } = await supa.from('purchases')
+      .select('product, status, expires_at, created_at')
+      .eq('user_id', userId)
+      .eq('status', 'completed');
+
+    if (error) { res.status(500).json({ error: error.message }); return; }
+
+    // Filter active purchases (non-expired subscriptions + permanent items)
+    const now = new Date();
+    const active = (data || []).filter(p => {
+      if (!p.expires_at) return true; // permanent purchase (avatar, music)
+      return new Date(p.expires_at) > now; // subscription not expired
+    });
+
+    // Build response
+    const hasPremium = active.some(p => p.product.startsWith('pass_'));
+    const premiumExpiry = active.find(p => p.product.startsWith('pass_'))?.expires_at || null;
+    const unlockedItems = active.filter(p => !p.product.startsWith('pass_')).map(p => p.product);
+
+    res.json({ hasPremium, premiumExpiry, unlockedItems, purchases: active });
+  } catch(e) {
+    console.error('Purchases API error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // ── STRIPE PRODUCTS ──
 const STRIPE_PRODUCTS = {
