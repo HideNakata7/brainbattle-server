@@ -63,8 +63,14 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
       expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
     }
 
-    // Store in Supabase
+    // Store in Supabase (with idempotency check)
     try {
+      // Check if this session was already processed
+      const { data: existing } = await supa.from('purchases').select('id').eq('stripe_session_id', session.id);
+      if (existing && existing.length > 0) {
+        console.log('⚠️ Webhook already processed for session:', session.id);
+        res.json({ received: true }); return;
+      }
       const { error } = await supa.from('purchases').insert({
         user_id: userId,
         product: product,
@@ -85,11 +91,21 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 app.use(express.json());
 app.get('/', (req, res) => res.send('Mind Impact Server ✅'));
 
-// ── VERIFY PURCHASES ──
+// ── VERIFY PURCHASES (with auth token) ──
 app.get('/api/purchases/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
     if (!userId) { res.status(400).json({ error: 'Missing userId' }); return; }
+
+    // Verify auth token
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const token = authHeader.replace('Bearer ', '');
+      const { data: { user }, error: authError } = await supa.auth.getUser(token);
+      if (authError || !user || user.id !== userId) {
+        res.status(403).json({ error: 'Unauthorized' }); return;
+      }
+    }
 
     const { data, error } = await supa.from('purchases')
       .select('product, status, expires_at, created_at')
@@ -98,14 +114,12 @@ app.get('/api/purchases/:userId', async (req, res) => {
 
     if (error) { res.status(500).json({ error: error.message }); return; }
 
-    // Filter active purchases (non-expired subscriptions + permanent items)
     const now = new Date();
     const active = (data || []).filter(p => {
-      if (!p.expires_at) return true; // permanent purchase (avatar, music)
-      return new Date(p.expires_at) > now; // subscription not expired
+      if (!p.expires_at) return true;
+      return new Date(p.expires_at) > now;
     });
 
-    // Build response
     const hasPremium = active.some(p => p.product.startsWith('pass_'));
     const premiumExpiry = active.find(p => p.product.startsWith('pass_'))?.expires_at || null;
     const unlockedItems = active.filter(p => !p.product.startsWith('pass_')).map(p => p.product);
@@ -139,6 +153,11 @@ app.post('/create-checkout-session', async (req, res) => {
     const { product, userId, username, successUrl, cancelUrl } = req.body;
     const prod = STRIPE_PRODUCTS[product];
     if (!prod) { res.status(400).json({ error: 'Product not found' }); return; }
+
+    // Validate redirect URLs (prevent open redirect)
+    const allowedDomains = ['mindimpact.online', 'brainbattle-client.vercel.app', 'localhost'];
+    const isValidUrl = (url) => { try { const u = new URL(url); return allowedDomains.some(d => u.hostname.includes(d)); } catch { return false; } };
+    if (!isValidUrl(successUrl) || !isValidUrl(cancelUrl)) { res.status(400).json({ error: 'Invalid redirect URL' }); return; }
 
     const sessionConfig = {
       payment_method_types: ['card'],
@@ -282,6 +301,20 @@ function decodeHTMLEntities(str) {
 // ══════════════════════════════════════════
 //  SOCKET.IO
 // ══════════════════════════════════════════
+// ── SOCKET RATE LIMITING ──
+const socketRateLimits = {};
+function rateLimitSocket(socketId, event, maxPerMinute = 30) {
+  const key = socketId + ':' + event;
+  const now = Date.now();
+  if (!socketRateLimits[key]) socketRateLimits[key] = [];
+  socketRateLimits[key] = socketRateLimits[key].filter(t => now - t < 60000);
+  if (socketRateLimits[key].length >= maxPerMinute) return false;
+  socketRateLimits[key].push(now);
+  return true;
+}
+// Clean up rate limit data every 5 minutes
+setInterval(() => { Object.keys(socketRateLimits).forEach(k => { if (!socketRateLimits[k].length) delete socketRateLimits[k]; }); }, 300000);
+
 io.on('connection', (socket) => {
   console.log(`✅ Connecté: ${socket.id}`);
 
@@ -489,6 +522,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('private_msg', ({ toUserId, content, fromUsername, fromAvatar }) => {
+    if (!rateLimitSocket(socket.id, 'private_msg', 15)) return;
     if (!content || typeof content !== 'string' || !content.trim() || content.length > 200) return;
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
@@ -509,6 +543,7 @@ io.on('connection', (socket) => {
 
   // Chat
   socket.on('chat_msg', ({ code, name, msg }) => {
+    if (!rateLimitSocket(socket.id, 'chat_msg', 20)) return;
     if (!msg || typeof msg !== 'string' || !msg.trim() || msg.length > 120) return;
     // Broadcast to everyone else in the room
     socket.to(code).emit('chat_msg', { name, msg });
@@ -516,6 +551,7 @@ io.on('connection', (socket) => {
 
   // Emotes
   socket.on('emote', ({ code, emote, name }) => {
+    if (!rateLimitSocket(socket.id, 'emote', 10)) return;
     socket.to(code).emit('emote', { emote, name });
   });
 
