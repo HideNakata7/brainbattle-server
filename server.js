@@ -36,6 +36,15 @@ const io     = new Server(server, {
 
 app.use(cors({ origin: ALLOWED_ORIGINS }));
 
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
 // Stripe webhook needs raw body — must be BEFORE express.json()
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -495,15 +504,36 @@ io.on('connection', (socket) => {
 
   // ── DÉCONNEXION ──
   // ── FRIENDS & ONLINE STATUS ──
-  socket.on('user_online', ({ userId, username }) => {
-    socket.userId = userId;
-    socket.username = username;
-    // Broadcast to friends (simplified — broadcast to all for now)
+  socket.on('user_online', async ({ userId, username, token }) => {
+    // Validate userId with Supabase auth token
+    if (token) {
+      try {
+        const { data: { user }, error } = await supa.auth.getUser(token);
+        if (!error && user && user.id === userId) {
+          socket.userId = userId;
+          socket.username = username;
+          socket.verified = true;
+        } else {
+          socket.userId = userId;
+          socket.username = username;
+          socket.verified = false;
+        }
+      } catch(e) {
+        socket.userId = userId;
+        socket.username = username;
+        socket.verified = false;
+      }
+    } else {
+      socket.userId = userId;
+      socket.username = username;
+      socket.verified = false;
+    }
     socket.broadcast.emit('friend_online', { userId });
   });
 
   socket.on('friend_request', ({ toUserId, fromUsername, fromAvatar }) => {
-    // Find socket of target user and notify
+    if (!socket.verified) return; // Must be verified to send friend requests
+    if (!rateLimitSocket(socket.id, 'friend_request', 10)) return;
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
         s.emit('friend_request_received', { fromUsername, fromAvatar });
@@ -533,6 +563,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('game_invite', ({ toUserId, fromUsername, groupCode, mode }) => {
+    if (!rateLimitSocket(socket.id, 'game_invite', 10)) return;
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
         s.emit('game_invite_received', { fromUsername, groupCode, mode });
