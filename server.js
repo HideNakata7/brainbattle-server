@@ -36,13 +36,13 @@ const io     = new Server(server, {
 
 app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json());
-app.get('/', (req, res) => res.send('BrainBattle Server ✅'));
+app.get('/', (req, res) => res.send('Mind Impact Server ✅'));
 
 // ── STRIPE PRODUCTS ──
 const STRIPE_PRODUCTS = {
   // Abonnements
-  pass_monthly:           { name: 'BrainBattle Pass Mensuel',    price: 299,  mode: 'subscription', interval: 'month' },
-  pass_yearly:            { name: 'BrainBattle Pass Annuel',     price: 1999, mode: 'subscription', interval: 'year'  },
+  pass_monthly:           { name: 'Mind Impact Pass Mensuel',    price: 299,  mode: 'subscription', interval: 'month' },
+  pass_yearly:            { name: 'Mind Impact Pass Annuel',     price: 1999, mode: 'subscription', interval: 'year'  },
   // Avatars exclusifs boutique
   avatar_shadow_samurai:  { name: 'Avatar Samouraï des Ombres',  price: 99,   mode: 'payment' },
   avatar_twilight_assassin:{ name: 'Avatar Assassin du Crépuscule', price: 99, mode: 'payment' },
@@ -777,7 +777,7 @@ async function createMatchmadeRoom(playerList, mode, io) {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🚀 BrainBattle Server lancé sur le port ${PORT}`);
+  console.log(`🚀 Mind Impact Server lancé sur le port ${PORT}`);
 });
 
 // ══════════════════════════════════════════
