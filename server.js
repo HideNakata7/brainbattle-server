@@ -153,7 +153,6 @@ const STRIPE_PRODUCTS = {
   // Musiques exclusives boutique
   music_new_world:        { name: 'Musique Nouveau Monde',       price: 99,   mode: 'payment' },
   music_celebration:      { name: 'Musique Célébration',         price: 99,   mode: 'payment' },
-  // Sans publicité
   no_ads:                 { name: 'Sans Publicité (à vie)',      price: 299,  mode: 'payment' },
 };
 
