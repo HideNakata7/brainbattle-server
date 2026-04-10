@@ -2,45 +2,159 @@ const express   = require('express');
 const http      = require('http');
 const { Server } = require('socket.io');
 const cors      = require('cors');
-// Stripe — remplace par ta clé secrète depuis le dashboard Stripe
+const { createClient } = require('@supabase/supabase-js');
 // Chargement des variables d'environnement depuis .env
 try { require('dotenv').config(); } catch(e) {}
-const STRIPE_SECRET    = process.env.STRIPE_SECRET_KEY;
-const SUPABASE_URL     = process.env.SUPABASE_URL;
-const SUPABASE_ANON    = process.env.SUPABASE_ANON_KEY;
+const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;
 
+// Supabase — questions FR
+const supa = createClient(
+  'https://gqjcmjncyhcioxvjkasc.supabase.co',
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdxamNtam5jeWhjaW94dmprYXNjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3NjQ4NjksImV4cCI6MjA4OTM0MDg2OX0.wvpLAEkUKHlcV1Js4ZDjT91u9RCRIL60EKGNwH8RjYA'
+);
+
+const CAT_MAP = {
+  '9':'General Knowledge','10':'Entertainment: Books','11':'Entertainment: Film',
+  '12':'Entertainment: Music','14':'Entertainment: Television','15':'Entertainment: Video Games',
+  '17':'Science & Nature','18':'Science: Computers','21':'Sports','22':'Geography',
+  '23':'History','25':'Art','27':'Animals','31':'Entertainment: Japanese Anime & Manga',
+};
 let stripe;
 try { stripe = require('stripe')(STRIPE_SECRET); } catch(e) { console.warn('Stripe not installed. Run: npm install stripe'); }
 
-let supabase;
-try {
-  const { createClient } = require('@supabase/supabase-js');
-  supabase = createClient(SUPABASE_URL, SUPABASE_ANON);
-  console.log('✅ Supabase connecté');
-} catch(e) { console.warn('⚠️ Supabase non disponible:', e.message); }
-
 const app    = express();
 const server = http.createServer(app);
+const ALLOWED_ORIGINS = [
+  'https://brainbattle-client.vercel.app',
+  'http://localhost:3000',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+];
 const io     = new Server(server, {
-  cors: { origin: '*', methods: ['GET','POST'] }
+  cors: { origin: ALLOWED_ORIGINS, methods: ['GET','POST'] }
 });
 
-app.use(cors());
+app.use(cors({ origin: ALLOWED_ORIGINS }));
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
+// Stripe webhook needs raw body — must be BEFORE express.json()
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) { res.status(500).send('Webhook not configured'); return; }
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch(e) {
+    console.error('⚠️ Webhook signature failed:', e.message);
+    return res.status(400).send('Webhook Error: ' + e.message);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const { userId, product } = session.metadata || {};
+    if (!userId || !product) { res.json({ received: true }); return; }
+
+    console.log('💰 Payment confirmed:', product, 'for user', userId);
+
+    // Calculate expiry for subscriptions
+    let expiresAt = null;
+    if (product === 'pass_monthly') {
+      expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    } else if (product === 'pass_yearly') {
+      expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    // Store in Supabase (with idempotency check)
+    try {
+      // Check if this session was already processed
+      const { data: existing } = await supa.from('purchases').select('id').eq('stripe_session_id', session.id);
+      if (existing && existing.length > 0) {
+        console.log('⚠️ Webhook already processed for session:', session.id);
+        res.json({ received: true }); return;
+      }
+      const { error } = await supa.from('purchases').insert({
+        user_id: userId,
+        product: product,
+        stripe_session_id: session.id,
+        status: 'completed',
+        expires_at: expiresAt
+      });
+      if (error) console.error('Supabase insert error:', error.message);
+      else console.log('✅ Purchase saved to DB:', product);
+    } catch(e) {
+      console.error('DB error:', e.message);
+    }
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
-app.get('/', (req, res) => res.send('BrainBattle Server ✅'));
-app.use(express.json());
+app.get('/', (req, res) => res.send('Mind Impact Server ✅'));
+
+// ── VERIFY PURCHASES (with auth token) ──
+app.get('/api/purchases/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) { res.status(400).json({ error: 'Missing userId' }); return; }
+
+    // Verify auth token
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const token = authHeader.replace('Bearer ', '');
+      const { data: { user }, error: authError } = await supa.auth.getUser(token);
+      if (authError || !user || user.id !== userId) {
+        res.status(403).json({ error: 'Unauthorized' }); return;
+      }
+    }
+
+    const { data, error } = await supa.from('purchases')
+      .select('product, status, expires_at, created_at')
+      .eq('user_id', userId)
+      .eq('status', 'completed');
+
+    if (error) { res.status(500).json({ error: error.message }); return; }
+
+    const now = new Date();
+    const active = (data || []).filter(p => {
+      if (!p.expires_at) return true;
+      return new Date(p.expires_at) > now;
+    });
+
+    const hasPremium = active.some(p => p.product.startsWith('pass_'));
+    const premiumExpiry = active.find(p => p.product.startsWith('pass_'))?.expires_at || null;
+    const unlockedItems = active.filter(p => !p.product.startsWith('pass_')).map(p => p.product);
+
+    res.json({ hasPremium, premiumExpiry, unlockedItems, purchases: active });
+  } catch(e) {
+    console.error('Purchases API error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // ── STRIPE PRODUCTS ──
 const STRIPE_PRODUCTS = {
-  pass_monthly:           { name: 'Mind Impact Pass Mensuel',  price: 299,  mode: 'subscription', interval: 'month' },
-  pass_yearly:            { name: 'Mind Impact Pass Annuel',   price: 1999, mode: 'subscription', interval: 'year'  },
-  avatar_shadow_samurai:  { name: 'Avatar Samouraï des Ombres', price: 99,  mode: 'payment' },
+  // Abonnements
+  pass_monthly:           { name: 'Mind Impact Pass Mensuel',    price: 299,  mode: 'subscription', interval: 'month' },
+  pass_yearly:            { name: 'Mind Impact Pass Annuel',     price: 1999, mode: 'subscription', interval: 'year'  },
+  // Avatars exclusifs boutique
+  avatar_shadow_samurai:  { name: 'Avatar Samouraï des Ombres',  price: 99,   mode: 'payment' },
   avatar_twilight_assassin:{ name: 'Avatar Assassin du Crépuscule', price: 99, mode: 'payment' },
-  avatar_anubis:          { name: 'Avatar Anubis',              price: 99,  mode: 'payment' },
-  avatar_fenrir:          { name: 'Avatar Fenrir',              price: 99,  mode: 'payment' },
-  music_new_world:        { name: 'Musique Nouveau Monde',      price: 99,  mode: 'payment' },
-  music_celebration:      { name: 'Musique Célébration',        price: 99,  mode: 'payment' },
-  no_ads:                 { name: 'Sans Publicité (à vie)',     price: 299, mode: 'payment' },
+  avatar_anubis:          { name: 'Avatar Anubis',               price: 99,   mode: 'payment' },
+  avatar_fenrir:          { name: 'Avatar Fenrir',               price: 99,   mode: 'payment' },
+  // Musiques exclusives boutique
+  music_new_world:        { name: 'Musique Nouveau Monde',       price: 99,   mode: 'payment' },
+  music_celebration:      { name: 'Musique Célébration',         price: 99,   mode: 'payment' },
+  // Sans publicité
+  no_ads:                 { name: 'Sans Publicité (à vie)',      price: 299,  mode: 'payment' },
 };
 
 // ── STRIPE CHECKOUT ──
@@ -50,6 +164,11 @@ app.post('/create-checkout-session', async (req, res) => {
     const { product, userId, username, successUrl, cancelUrl } = req.body;
     const prod = STRIPE_PRODUCTS[product];
     if (!prod) { res.status(400).json({ error: 'Product not found' }); return; }
+
+    // Validate redirect URLs (prevent open redirect)
+    const allowedDomains = ['mindimpact.online', 'brainbattle-client.vercel.app', 'localhost'];
+    const isValidUrl = (url) => { try { const u = new URL(url); return allowedDomains.some(d => u.hostname.includes(d)); } catch { return false; } };
+    if (!isValidUrl(successUrl) || !isValidUrl(cancelUrl)) { res.status(400).json({ error: 'Invalid redirect URL' }); return; }
 
     const sessionConfig = {
       payment_method_types: ['card'],
@@ -88,7 +207,12 @@ function genCode() {
 }
 
 function shuffle(arr) {
-  return [...arr].sort(() => Math.random() - 0.5);
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
 // ══════════════════════════════════════════
@@ -107,102 +231,101 @@ const players = {};  // socketId → { code, name, avatar }
 // }
 
 // ══════════════════════════════════════════
-//  FETCH QUESTIONS depuis Supabase (FR)
+//  FETCH QUESTIONS — Supabase FR (priorité) + OpenTDB EN (fallback)
 // ══════════════════════════════════════════
-const CAT_MAP = {
-  '9':'General Knowledge','10':'Entertainment: Books','11':'Entertainment: Film',
-  '12':'Entertainment: Music','13':'Entertainment: Musicals & Theatres',
-  '14':'Entertainment: Television','15':'Entertainment: Video Games',
-  '16':'Entertainment: Board Games','17':'Science & Nature','18':'Science: Computers',
-  '19':'Science: Mathematics','20':'Mythology','21':'Sports','22':'Geography',
-  '23':'History','24':'Politics','25':'Art','26':'Celebrities','27':'Animals',
-  '28':'Vehicles','29':'Entertainment: Comics','30':'Science: Gadgets',
-  '31':'Entertainment: Japanese Anime & Manga','32':'Entertainment: Cartoon & Animations'
-};
-
-function isValidQuestion(q) {
-  if (!q) return false;
-  const txt = q.question_fr || '';
-  if (!txt || txt.trim().length < 10) return false;
-  if (txt === '…' || txt === '...' || txt === '?') return false;
-  if (!Array.isArray(q.answers_fr) || q.answers_fr.length < 4) return false;
-  if (q.answers_fr.some(a => !a || a.trim().length === 0)) return false;
-  if (q.correct_index === null || q.correct_index === undefined) return false;
-  return true;
-}
-
 async function fetchQuestions(nb, category, difficulty) {
-  if (!supabase) throw new Error('Supabase non configuré.');
+  nb = Math.max(1, Math.min(50, parseInt(nb) || 10));
 
-  const diff = difficulty === 'hardcore' ? 'hard' : difficulty;
-
-  let query = supabase
-    .from('translated_questions')
-    .select('category, question_fr, answers_fr, correct_index')
-    .not('question_fr', 'is', null);
-
-  if (category && category !== '0') {
-    const catName = CAT_MAP[String(category)] || category;
-    query = query.ilike('category', '%' + catName + '%');
-  }
-  if (diff) query = query.eq('difficulty', diff);
-
-  // Random offset pour maximiser la variété (11k questions dispo)
-  const maxOffset = 800;
-  const offset = Math.floor(Math.random() * maxOffset);
-  const poolSize = nb * 8;
-
-  const { data: d1, error } = await query.range(offset, offset + poolSize - 1);
-  if (error) throw new Error('Supabase error: ' + error.message);
-
-  let pool = d1 || [];
-
-  // Si pas assez avec l'offset, compléter depuis le début
-  if (pool.length < nb) {
-    const { data: d2 } = await query.limit(poolSize);
-    const combined = shuffle([...pool, ...(d2 || [])]);
-    const seen = new Set();
-    pool = combined.filter(q => {
-      if (seen.has(q.question_fr)) return false;
-      seen.add(q.question_fr); return true;
-    });
-  }
-
-  // Fallback: sans filtre catégorie
-  if (pool.length < nb) {
-    let q2 = supabase.from('translated_questions')
+  // ── Tentative 1 : Supabase FR ──
+  try {
+    const catName = (category && category !== '0') ? (CAT_MAP[String(category)] || category) : null;
+    let query = supa.from('translated_questions')
       .select('category, question_fr, answers_fr, correct_index')
       .not('question_fr', 'is', null);
-    if (diff) q2 = q2.eq('difficulty', diff);
-    const off2 = Math.floor(Math.random() * maxOffset);
-    const { data: data2 } = await q2.range(off2, off2 + poolSize - 1);
-    pool = shuffle(data2 || []);
-  }
+    if (catName) query = query.ilike('category', '%' + catName + '%');
+    if (difficulty && ['easy','medium','hard'].includes(difficulty)) query = query.eq('difficulty', difficulty);
 
-  // Last resort: no filters
-  if (pool.length < nb) {
-    const off3 = Math.floor(Math.random() * maxOffset);
-    const { data: data3 } = await supabase
-      .from('translated_questions')
+    const offset = Math.floor(Math.random() * 500);
+    const { data } = await query.range(offset, offset + nb * 5 - 1);
+
+    if (data && data.length >= nb) {
+      return shuffle(data).slice(0, nb).map(q => ({
+        cat:     q.category || 'Culture générale',
+        q:       q.question_fr.trim(),
+        answers: q.answers_fr,
+        correct: q.correct_index
+      }));
+    }
+
+    // Tentative sans filtres
+    const { data: d2 } = await supa.from('translated_questions')
       .select('category, question_fr, answers_fr, correct_index')
       .not('question_fr', 'is', null)
-      .range(off3, off3 + poolSize - 1);
-    pool = shuffle(data3 || []);
+      .limit(nb * 5);
+    if (d2 && d2.length >= nb) {
+      return shuffle(d2).slice(0, nb).map(q => ({
+        cat: q.category || 'Culture générale', q: q.question_fr.trim(),
+        answers: q.answers_fr, correct: q.correct_index
+      }));
+    }
+  } catch(e) {
+    console.warn('Supabase fetch error, falling back to OpenTDB:', e.message);
   }
 
-  if (pool.length < nb) throw new Error('Pas assez de questions disponibles.');
+  // ── Fallback : OpenTDB EN ──
+  let url = `https://opentdb.com/api.php?amount=${nb}&type=multiple`;
+  if (category && category !== '0') url += `&category=${encodeURIComponent(category)}`;
+  if (difficulty && ['easy','medium','hard'].includes(difficulty)) url += `&difficulty=${difficulty}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res  = await fetch(url, { signal: controller.signal });
+    const data = await res.json();
+    if (data.response_code !== 0) throw new Error('Pas assez de questions.');
+    return data.results.map(q => {
+      const answers = shuffle([...q.incorrect_answers, q.correct_answer]);
+      return {
+        cat:     decodeHTMLEntities(q.category),
+        q:       decodeHTMLEntities(q.question),
+        answers: answers.map(a => decodeHTMLEntities(a)),
+        correct: answers.indexOf(q.correct_answer)
+      };
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
-  return shuffle(pool).filter(isValidQuestion).slice(0, nb).map(q => ({
-    cat:     q.category || 'Culture générale',
-    q:       q.question_fr.trim(),
-    answers: q.answers_fr,
-    correct: q.correct_index,
-  }));
+function decodeHTMLEntities(str) {
+  return str
+    .replace(/&amp;/g,  '&')
+    .replace(/&lt;/g,   '<')
+    .replace(/&gt;/g,   '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&ldquo;/g,'"')
+    .replace(/&rdquo;/g,'"')
+    .replace(/&laquo;/g,'«')
+    .replace(/&raquo;/g,'»');
 }
 
 // ══════════════════════════════════════════
 //  SOCKET.IO
 // ══════════════════════════════════════════
+// ── SOCKET RATE LIMITING ──
+const socketRateLimits = {};
+function rateLimitSocket(socketId, event, maxPerMinute = 30) {
+  const key = socketId + ':' + event;
+  const now = Date.now();
+  if (!socketRateLimits[key]) socketRateLimits[key] = [];
+  socketRateLimits[key] = socketRateLimits[key].filter(t => now - t < 60000);
+  if (socketRateLimits[key].length >= maxPerMinute) return false;
+  socketRateLimits[key].push(now);
+  return true;
+}
+// Clean up rate limit data every 5 minutes
+setInterval(() => { Object.keys(socketRateLimits).forEach(k => { if (!socketRateLimits[k].length) delete socketRateLimits[k]; }); }, 300000);
+
 io.on('connection', (socket) => {
   console.log(`✅ Connecté: ${socket.id}`);
 
@@ -325,10 +448,10 @@ io.on('connection', (socket) => {
     }
     // Chrono: score based on correctness + combo
     if (room.mode === 'chrono') {
+      player.answered = (player.answered || 0) + 1;
       if (correct) {
         player.combo = (player.combo || 0) + 1;
         player.correct = (player.correct || 0) + 1;
-        // Combo bonus
         let comboBonus = 0;
         if (player.combo >= 10) comboBonus = 100;
         else if (player.combo >= 5) comboBonus = 50;
@@ -336,20 +459,15 @@ io.on('connection', (socket) => {
         const chronoPts = 100 + comboBonus;
         player.chronoScore = (player.chronoScore || 0) + chronoPts;
         player.score = player.chronoScore;
-        // Send next question to this player
         socket.emit('chrono_result', { correct: true, combo: player.combo, points: chronoPts, score: player.chronoScore });
-        sendChronoQuestion(code, socket.id, io);
       } else {
-        player.combo = 0; // reset combo
-        player.answered = (player.answered || 0) + 1;
+        player.combo = 0;
         socket.emit('chrono_result', { correct: false, combo: 0, points: 0, score: player.chronoScore || 0 });
-        sendChronoQuestion(code, socket.id, io);
       }
-      player.answered = (player.answered || 0) + 1;
-      // Broadcast scores
+      sendChronoQuestion(code, socket.id, io);
       const scores = Object.entries(room.players).map(([id, p]) => ({ id, name: p.name, avatar: p.avatar, score: p.chronoScore || 0, combo: p.combo || 0 })).sort((a,b) => b.score - a.score);
       io.to(code).emit('chrono_scores_update', { scores });
-      return; // Don't process normal answer flow
+      return;
     }
     // Battle royale: lose a life on wrong answer
     if (room.mode === 'royale' && !correct) {
@@ -388,15 +506,36 @@ io.on('connection', (socket) => {
 
   // ── DÉCONNEXION ──
   // ── FRIENDS & ONLINE STATUS ──
-  socket.on('user_online', ({ userId, username }) => {
-    socket.userId = userId;
-    socket.username = username;
-    // Broadcast to friends (simplified — broadcast to all for now)
+  socket.on('user_online', async ({ userId, username, token }) => {
+    // Validate userId with Supabase auth token
+    if (token) {
+      try {
+        const { data: { user }, error } = await supa.auth.getUser(token);
+        if (!error && user && user.id === userId) {
+          socket.userId = userId;
+          socket.username = username;
+          socket.verified = true;
+        } else {
+          socket.userId = userId;
+          socket.username = username;
+          socket.verified = false;
+        }
+      } catch(e) {
+        socket.userId = userId;
+        socket.username = username;
+        socket.verified = false;
+      }
+    } else {
+      socket.userId = userId;
+      socket.username = username;
+      socket.verified = false;
+    }
     socket.broadcast.emit('friend_online', { userId });
   });
 
   socket.on('friend_request', ({ toUserId, fromUsername, fromAvatar }) => {
-    // Find socket of target user and notify
+    if (!socket.verified) return; // Must be verified to send friend requests
+    if (!rateLimitSocket(socket.id, 'friend_request', 10)) return;
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
         s.emit('friend_request_received', { fromUsername, fromAvatar });
@@ -415,7 +554,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('private_msg', ({ toUserId, content, fromUsername, fromAvatar }) => {
-    if (!content || content.length > 200) return;
+    if (!rateLimitSocket(socket.id, 'private_msg', 15)) return;
+    if (!content || typeof content !== 'string' || !content.trim() || content.length > 200) return;
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
         s.emit('private_msg_received', { content, fromUsername, fromAvatar, fromUserId: socket.userId });
@@ -425,6 +565,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('game_invite', ({ toUserId, fromUsername, groupCode, mode }) => {
+    if (!rateLimitSocket(socket.id, 'game_invite', 10)) return;
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
         s.emit('game_invite_received', { fromUsername, groupCode, mode });
@@ -435,18 +576,28 @@ io.on('connection', (socket) => {
 
   // Chat
   socket.on('chat_msg', ({ code, name, msg }) => {
-    if (!msg || msg.length > 120) return;
+    if (!rateLimitSocket(socket.id, 'chat_msg', 20)) return;
+    if (!msg || typeof msg !== 'string' || !msg.trim() || msg.length > 120) return;
     // Broadcast to everyone else in the room
     socket.to(code).emit('chat_msg', { name, msg });
   });
 
   // Emotes
   socket.on('emote', ({ code, emote, name }) => {
+    if (!rateLimitSocket(socket.id, 'emote', 10)) return;
     socket.to(code).emit('emote', { emote, name });
   });
 
   socket.on('disconnect', () => {
     if (socket.userId) socket.broadcast.emit('friend_offline', { userId: socket.userId });
+    // Clean up matchmaking queues
+    Object.keys(mmQueues).forEach(m => {
+      const idx = mmQueues[m].findIndex(q => q.socketId === socket.id);
+      if (idx !== -1) mmQueues[m].splice(idx, 1);
+    });
+    // Clean up team queue
+    const tIdx = teamQueue.findIndex(q => q.socketId === socket.id);
+    if (tIdx !== -1) teamQueue.splice(tIdx, 1);
     const pdata = players[socket.id];
     if (pdata) {
       const room = rooms[pdata.code];
@@ -493,18 +644,93 @@ io.on('connection', (socket) => {
   socket.on('host_config', ({ code, mode, category, difficulty, maxQ, timer }) => {
     const room = rooms[code];
     if (!room || room.host !== socket.id) return;
-    if (mode)       room.mode       = mode;
-    if (category)   room.category   = category;
-    if (difficulty !== undefined) room.difficulty = difficulty;
-    if (maxQ)       room.maxQ       = maxQ;
-    if (timer)      room.timer_sec  = timer;
-    // Broadcast updated config to all players
-    io.to(code).emit('host_config_updated', { mode, category, difficulty, maxQ, timer });
-    console.log(`⚙️ Config salon ${code}: mode=${mode} cat=${category} diff=${difficulty} nb=${maxQ} timer=${timer}`);
+    const validModes = ['friends','royale','team','chrono','tactical'];
+    const validDiffs = ['','easy','medium','hard'];
+    if (mode && validModes.includes(mode))       room.mode       = mode;
+    if (category)   room.category   = String(category).slice(0, 10);
+    if (validDiffs.includes(difficulty)) room.difficulty = difficulty;
+    if (maxQ) room.maxQ = Math.max(1, Math.min(50, parseInt(maxQ) || 10));
+    if (timer) room.timer_sec = Math.max(5, Math.min(60, parseInt(timer) || 20));
+    io.to(code).emit('host_config_updated', { mode: room.mode, category: room.category, difficulty: room.difficulty, maxQ: room.maxQ, timer: room.timer_sec });
+    console.log(`⚙️ Config salon ${code}: mode=${room.mode} cat=${room.category} diff=${room.difficulty} nb=${room.maxQ} timer=${room.timer_sec}`);
   });
 
   // ── TACTICAL EVENTS ──
   registerTacticalEvents(socket, io);
+
+  // ── MATCHMAKING ──
+  socket.on('join_matchmaking', ({ mode, name, avatar, userId, groupCode, elo }) => {
+    const data = { socketId:socket.id, name, avatar, userId, groupCode, elo:elo||1, mode, joinedAt: Date.now() };
+    Object.keys(mmQueues).forEach(m => {
+      const idx = mmQueues[m].findIndex(q=>q.socketId===socket.id);
+      if(idx!==-1) mmQueues[m].splice(idx,1);
+    });
+    if(!mmQueues[mode]) mmQueues[mode]=[];
+    mmQueues[mode].push(data);
+    if(groupCode){ if(!mmGroups[groupCode]) mmGroups[groupCode]=[]; mmGroups[groupCode].push(data); }
+    console.log(`🔍 MM [${mode}]: ${name} (${mmQueues[mode].length} waiting)`);
+    tryMatchmaking(mode, io);
+  });
+
+  socket.on('join_matchmade_room', ({ code }) => {
+    const room = rooms[code];
+    if(!room) return;
+    if(!room.players[socket.id]) room.players[socket.id]={name:'Joueur',avatar:'🎮',score:0,lives:3,alive:true};
+    players[socket.id]={code,name:room.players[socket.id].name};
+    socket.join(code);
+    io.to(code).emit('player_joined',{room:sanitizeRoom(room)});
+  });
+
+  // Pre-lobby group management
+  socket.on('register_group', ({ groupCode, name, avatar, userId }) => {
+    if (!mmGroups[groupCode]) mmGroups[groupCode] = [];
+    mmGroups[groupCode] = mmGroups[groupCode].filter(p => p.socketId !== socket.id);
+    mmGroups[groupCode].push({ socketId: socket.id, name, avatar, userId });
+    socket.join('grp-' + groupCode);
+    console.log(`👥 Groupe ${groupCode}: ${name} enregistré`);
+  });
+
+  socket.on('group_mode_change', ({ groupCode, mode }) => {
+    socket.to('grp-' + groupCode).emit('mm_mode_changed', { mode });
+    console.log(`🔄 Groupe ${groupCode}: mode → ${mode}`);
+  });
+
+  socket.on('leave_group', ({ groupCode }) => {
+    if (groupCode && mmGroups[groupCode]) {
+      mmGroups[groupCode] = mmGroups[groupCode].filter(p => p.socketId !== socket.id);
+    }
+    socket.leave('grp-' + groupCode);
+  });
+
+  socket.on('join_group', ({ groupCode, name, avatar, userId }) => {
+    if (!mmGroups[groupCode]) { socket.emit('error', { msg: 'Groupe introuvable.' }); return; }
+    mmGroups[groupCode].push({ socketId: socket.id, name, avatar, userId });
+    socket.join('grp-' + groupCode);
+    io.to('grp-' + groupCode).emit('mm_group_joined', { name, avatar });
+    socket.emit('mm_group_joined', { name: 'toi', avatar });
+    console.log(`👤 ${name} a rejoint le groupe ${groupCode}`);
+  });
+
+  socket.on('leave_matchmaking', ({ mode }) => {
+    if(mode&&mmQueues[mode]){
+      const idx=mmQueues[mode].findIndex(q=>q.socketId===socket.id);
+      if(idx!==-1) mmQueues[mode].splice(idx,1);
+    }
+  });
+
+  // ── TEAM RANKED MATCHMAKING ──
+  socket.on('find_team_match', (data) => {
+    const existing = teamQueue.findIndex(q => q.teamId === data.teamId);
+    if (existing !== -1) teamQueue.splice(existing, 1);
+    teamQueue.push({ socketId: socket.id, ...data });
+    console.log(`🔍 Matchmaking: ${data.teamName} [ELO: ${data.elo}] - Queue: ${teamQueue.length}`);
+    tryMatchTeams(io);
+  });
+
+  socket.on('cancel_team_match', () => {
+    const idx = teamQueue.findIndex(q => q.socketId === socket.id);
+    if (idx !== -1) { teamQueue.splice(idx, 1); console.log('❌ Matchmaking annulé'); }
+  });
 });
 
 // ══════════════════════════════════════════
@@ -586,7 +812,7 @@ function endGame(code) {
   room.status = 'results';
   clearTimeout(room.timer);
 
-  const ranking = Object.entries(room.players)
+  let ranking = Object.entries(room.players)
     .map(([id, p]) => ({ id, name: p.name, avatar: p.avatar, score: p.score, alive: p.alive, team: p.team }))
     .sort((a, b) => b.score - a.score);
 
@@ -595,7 +821,6 @@ function endGame(code) {
   if ((room.mode === 'team' || room.mode === 'team_ranked') && room.teamScores) {
     const winner = room.teamScores.A > room.teamScores.B ? 'A' : room.teamScores.B > room.teamScores.A ? 'B' : 'Égalité';
     teamResult = { scores: room.teamScores, winner };
-    // Add individual player ELO delta info for ranked
     if (room.mode === 'team_ranked') {
       ranking.forEach(p => {
         const player = room.players[p.id];
@@ -608,8 +833,9 @@ function endGame(code) {
 
   // Chrono: rank by chrono score
   if (room.mode === 'chrono') {
-    ranking.sort((a,b) => (room.players[b.id]?.chronoScore||0) - (room.players[a.id]?.chronoScore||0));
-    ranking = ranking.map(r => ({ ...r, score: room.players[r.id]?.chronoScore || 0 }));
+    ranking = ranking
+      .map(r => ({ ...r, score: room.players[r.id]?.chronoScore || 0 }))
+      .sort((a, b) => b.score - a.score);
   }
 
   io.to(code).emit('game_over', { ranking, teamResult, mode: room.mode });
@@ -651,71 +877,6 @@ function sanitizePlayers(players) {
 const mmQueues = { duel1v1:[], royale:[], team:[], tactical:[], chrono:[] };
 const mmGroups = {};
 
-io.on('connection', (socket) => {
-  socket.on('join_matchmaking', ({ mode, name, avatar, userId, groupCode, elo }) => {
-    const data = { socketId:socket.id, name, avatar, userId, groupCode, elo:elo||1, mode };
-    Object.keys(mmQueues).forEach(m => {
-      const idx = mmQueues[m].findIndex(q=>q.socketId===socket.id);
-      if(idx!==-1) mmQueues[m].splice(idx,1);
-    });
-    if(!mmQueues[mode]) mmQueues[mode]=[];
-    const joinedAt = Date.now();
-    mmQueues[mode].push(data);
-    if(groupCode){ if(!mmGroups[groupCode]) mmGroups[groupCode]=[]; mmGroups[groupCode].push(data); }
-    console.log(`🔍 MM [${mode}]: ${name} (${mmQueues[mode].length} waiting)`);
-    tryMatchmaking(mode, io);
-  });
-
-  socket.on('join_matchmade_room', ({ code }) => {
-    const room = rooms[code];
-    if(!room) return;
-    if(!room.players[socket.id]) room.players[socket.id]={name:'Joueur',avatar:'🎮',score:0,lives:3,alive:true};
-    players[socket.id]={code,name:room.players[socket.id].name};
-    socket.join(code);
-    io.to(code).emit('player_joined',{room:sanitizeRoom(room)});
-  });
-
-  // Pre-lobby group management
-  socket.on('register_group', ({ groupCode, name, avatar, userId }) => {
-    if (!mmGroups[groupCode]) mmGroups[groupCode] = [];
-    mmGroups[groupCode] = mmGroups[groupCode].filter(p => p.socketId !== socket.id);
-    mmGroups[groupCode].push({ socketId: socket.id, name, avatar, userId });
-    socket.join('grp-' + groupCode);
-    console.log(`👥 Groupe ${groupCode}: ${name} enregistré`);
-  });
-
-  socket.on('group_mode_change', ({ groupCode, mode }) => {
-    // Notify all group members except sender
-    socket.to('grp-' + groupCode).emit('mm_mode_changed', { mode });
-    console.log(`🔄 Groupe ${groupCode}: mode → ${mode}`);
-  });
-
-  socket.on('leave_group', ({ groupCode }) => {
-    if (groupCode && mmGroups[groupCode]) {
-      mmGroups[groupCode] = mmGroups[groupCode].filter(p => p.socketId !== socket.id);
-    }
-    socket.leave('grp-' + groupCode);
-  });
-
-  // Handle friend joining group via code
-  socket.on('join_group', ({ groupCode, name, avatar, userId }) => {
-    if (!mmGroups[groupCode]) { socket.emit('error', { msg: 'Groupe introuvable.' }); return; }
-    mmGroups[groupCode].push({ socketId: socket.id, name, avatar, userId });
-    socket.join('grp-' + groupCode);
-    // Notify group
-    io.to('grp-' + groupCode).emit('mm_group_joined', { name, avatar });
-    // Send current mode to newcomer
-    socket.emit('mm_group_joined', { name: 'toi', avatar });
-    console.log(`👤 ${name} a rejoint le groupe ${groupCode}`);
-  });
-
-  socket.on('leave_matchmaking', ({ mode }) => {
-    if(mode&&mmQueues[mode]){
-      const idx=mmQueues[mode].findIndex(q=>q.socketId===socket.id);
-      if(idx!==-1) mmQueues[mode].splice(idx,1);
-    }
-  });
-});
 
 function tryMatchmaking(mode, io) {
   const queue = mmQueues[mode]||[];
@@ -764,7 +925,7 @@ async function createMatchmadeRoom(playerList, mode, io) {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🚀 BrainBattle Server lancé sur le port ${PORT}`);
+  console.log(`🚀 Mind Impact Server lancé sur le port ${PORT}`);
 });
 
 // ══════════════════════════════════════════
@@ -772,27 +933,6 @@ server.listen(PORT, () => {
 // ══════════════════════════════════════════
 const teamQueue = []; // { socketId, teamId, teamName, teamTag, elo, userId, userName }
 
-io.on('connection', (socket) => {
-  // already handled above, but add team events here
-});
-
-// Re-register team matchmaking on each connection
-const origOn = io.on.bind(io);
-io.on('connection', (socket) => {
-
-  socket.on('find_team_match', (data) => {
-    const existing = teamQueue.findIndex(q => q.teamId === data.teamId);
-    if (existing !== -1) teamQueue.splice(existing, 1);
-    teamQueue.push({ socketId: socket.id, ...data });
-    console.log(`🔍 Matchmaking: ${data.teamName} [ELO: ${data.elo}] - Queue: ${teamQueue.length}`);
-    tryMatchTeams(io);
-  });
-
-  socket.on('cancel_team_match', () => {
-    const idx = teamQueue.findIndex(q => q.socketId === socket.id);
-    if (idx !== -1) { teamQueue.splice(idx, 1); console.log('❌ Matchmaking annulé'); }
-  });
-});
 
 function tryMatchTeams(io) {
   if (teamQueue.length < 2) return;
@@ -956,10 +1096,10 @@ async function startTacticalRound(code, io) {
   try {
     const qs = await fetchQuestions(1, '0', diff === 'easy' ? 'easy' : diff === 'medium' ? 'medium' : 'hard');
     question = qs[0] ? {
-      q:       qs[0].question || qs[0].q,
-      answers: qs[0].answers  || qs[0].incorrect_answers?.concat(qs[0].correct_answer),
-      correct: qs[0].correct  || 0,
-      cat:     qs[0].category || qs[0].cat || 'Culture générale',
+      q:       qs[0].q,
+      answers: qs[0].answers,
+      correct: qs[0].correct,
+      cat:     qs[0].cat || 'Culture générale',
       diff,
     } : null;
   } catch(e) { question = null; }
@@ -1087,8 +1227,8 @@ async function startChronoMode(code, io) {
   let remaining = Math.ceil((room.chronoDuration || 120000) / 1000);
   room.chronoCountdown = setInterval(() => {
     remaining--;
-    if (remaining >= 0) io.to(code).emit('chrono_countdown', { remaining });
-    if (remaining <= 0) { clearInterval(room.chronoCountdown); room.chronoCountdown = null; }
+    io.to(code).emit('chrono_countdown', { remaining });
+    if (remaining <= 0) clearInterval(room.chronoCountdown);
   }, 1000);
 }
 
