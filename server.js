@@ -5,9 +5,19 @@ const cors      = require('cors');
 // Stripe — remplace par ta clé secrète depuis le dashboard Stripe
 // Chargement des variables d'environnement depuis .env
 try { require('dotenv').config(); } catch(e) {}
-const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;
+const STRIPE_SECRET    = process.env.STRIPE_SECRET_KEY;
+const SUPABASE_URL     = process.env.SUPABASE_URL;
+const SUPABASE_ANON    = process.env.SUPABASE_ANON_KEY;
+
 let stripe;
 try { stripe = require('stripe')(STRIPE_SECRET); } catch(e) { console.warn('Stripe not installed. Run: npm install stripe'); }
+
+let supabase;
+try {
+  const { createClient } = require('@supabase/supabase-js');
+  supabase = createClient(SUPABASE_URL, SUPABASE_ANON);
+  console.log('✅ Supabase connecté');
+} catch(e) { console.warn('⚠️ Supabase non disponible:', e.message); }
 
 const app    = express();
 const server = http.createServer(app);
@@ -22,12 +32,15 @@ app.use(express.json());
 
 // ── STRIPE PRODUCTS ──
 const STRIPE_PRODUCTS = {
-  pass_monthly: { name: 'BrainBattle Pass Mensuel', price: 299,   mode: 'subscription', interval: 'month' },
-  pass_yearly:  { name: 'BrainBattle Pass Annuel',  price: 1999,  mode: 'subscription', interval: 'year'  },
-  xp_boost_24h: { name: 'Boost XP 24h',             price: 99,    mode: 'payment' },
-  xp_boost_7d:  { name: 'Boost XP 7 jours',         price: 299,   mode: 'payment' },
-  pack_starter: { name: 'Pack Cosmétiques Starter',  price: 199,   mode: 'payment' },
-  pack_premium: { name: 'Pack Cosmétiques Premium',  price: 499,   mode: 'payment' },
+  pass_monthly:           { name: 'Mind Impact Pass Mensuel',  price: 299,  mode: 'subscription', interval: 'month' },
+  pass_yearly:            { name: 'Mind Impact Pass Annuel',   price: 1999, mode: 'subscription', interval: 'year'  },
+  avatar_shadow_samurai:  { name: 'Avatar Samouraï des Ombres', price: 99,  mode: 'payment' },
+  avatar_twilight_assassin:{ name: 'Avatar Assassin du Crépuscule', price: 99, mode: 'payment' },
+  avatar_anubis:          { name: 'Avatar Anubis',              price: 99,  mode: 'payment' },
+  avatar_fenrir:          { name: 'Avatar Fenrir',              price: 99,  mode: 'payment' },
+  music_new_world:        { name: 'Musique Nouveau Monde',      price: 99,  mode: 'payment' },
+  music_celebration:      { name: 'Musique Célébration',        price: 99,  mode: 'payment' },
+  no_ads:                 { name: 'Sans Publicité (à vie)',     price: 299, mode: 'payment' },
 };
 
 // ── STRIPE CHECKOUT ──
@@ -94,37 +107,97 @@ const players = {};  // socketId → { code, name, avatar }
 // }
 
 // ══════════════════════════════════════════
-//  FETCH QUESTIONS depuis OpenTDB
+//  FETCH QUESTIONS depuis Supabase (FR)
 // ══════════════════════════════════════════
-async function fetchQuestions(nb, category, difficulty) {
-  let url = `https://opentdb.com/api.php?amount=${nb}&type=multiple`;
-  if (category && category !== '0') url += `&category=${category}`;
-  if (difficulty) url += `&difficulty=${difficulty}`;
-  const res  = await fetch(url);
-  const data = await res.json();
-  if (data.response_code !== 0) throw new Error('Pas assez de questions.');
-  return data.results.map(q => {
-    const answers = shuffle([...q.incorrect_answers, q.correct_answer]);
-    return {
-      cat:     decodeHTMLEntities(q.category),
-      q:       decodeHTMLEntities(q.question),
-      answers: answers.map(a => decodeHTMLEntities(a)),
-      correct: answers.indexOf(q.correct_answer)
-    };
-  });
+const CAT_MAP = {
+  '9':'General Knowledge','10':'Entertainment: Books','11':'Entertainment: Film',
+  '12':'Entertainment: Music','13':'Entertainment: Musicals & Theatres',
+  '14':'Entertainment: Television','15':'Entertainment: Video Games',
+  '16':'Entertainment: Board Games','17':'Science & Nature','18':'Science: Computers',
+  '19':'Science: Mathematics','20':'Mythology','21':'Sports','22':'Geography',
+  '23':'History','24':'Politics','25':'Art','26':'Celebrities','27':'Animals',
+  '28':'Vehicles','29':'Entertainment: Comics','30':'Science: Gadgets',
+  '31':'Entertainment: Japanese Anime & Manga','32':'Entertainment: Cartoon & Animations'
+};
+
+function isValidQuestion(q) {
+  if (!q) return false;
+  const txt = q.question_fr || '';
+  if (!txt || txt.trim().length < 10) return false;
+  if (txt === '…' || txt === '...' || txt === '?') return false;
+  if (!Array.isArray(q.answers_fr) || q.answers_fr.length < 4) return false;
+  if (q.answers_fr.some(a => !a || a.trim().length === 0)) return false;
+  if (q.correct_index === null || q.correct_index === undefined) return false;
+  return true;
 }
 
-function decodeHTMLEntities(str) {
-  return str
-    .replace(/&amp;/g,  '&')
-    .replace(/&lt;/g,   '<')
-    .replace(/&gt;/g,   '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&ldquo;/g,'"')
-    .replace(/&rdquo;/g,'"')
-    .replace(/&laquo;/g,'«')
-    .replace(/&raquo;/g,'»');
+async function fetchQuestions(nb, category, difficulty) {
+  if (!supabase) throw new Error('Supabase non configuré.');
+
+  const diff = difficulty === 'hardcore' ? 'hard' : difficulty;
+
+  let query = supabase
+    .from('translated_questions')
+    .select('category, question_fr, answers_fr, correct_index')
+    .not('question_fr', 'is', null);
+
+  if (category && category !== '0') {
+    const catName = CAT_MAP[String(category)] || category;
+    query = query.ilike('category', '%' + catName + '%');
+  }
+  if (diff) query = query.eq('difficulty', diff);
+
+  // Random offset pour maximiser la variété (11k questions dispo)
+  const maxOffset = 800;
+  const offset = Math.floor(Math.random() * maxOffset);
+  const poolSize = nb * 8;
+
+  const { data: d1, error } = await query.range(offset, offset + poolSize - 1);
+  if (error) throw new Error('Supabase error: ' + error.message);
+
+  let pool = d1 || [];
+
+  // Si pas assez avec l'offset, compléter depuis le début
+  if (pool.length < nb) {
+    const { data: d2 } = await query.limit(poolSize);
+    const combined = shuffle([...pool, ...(d2 || [])]);
+    const seen = new Set();
+    pool = combined.filter(q => {
+      if (seen.has(q.question_fr)) return false;
+      seen.add(q.question_fr); return true;
+    });
+  }
+
+  // Fallback: sans filtre catégorie
+  if (pool.length < nb) {
+    let q2 = supabase.from('translated_questions')
+      .select('category, question_fr, answers_fr, correct_index')
+      .not('question_fr', 'is', null);
+    if (diff) q2 = q2.eq('difficulty', diff);
+    const off2 = Math.floor(Math.random() * maxOffset);
+    const { data: data2 } = await q2.range(off2, off2 + poolSize - 1);
+    pool = shuffle(data2 || []);
+  }
+
+  // Last resort: no filters
+  if (pool.length < nb) {
+    const off3 = Math.floor(Math.random() * maxOffset);
+    const { data: data3 } = await supabase
+      .from('translated_questions')
+      .select('category, question_fr, answers_fr, correct_index')
+      .not('question_fr', 'is', null)
+      .range(off3, off3 + poolSize - 1);
+    pool = shuffle(data3 || []);
+  }
+
+  if (pool.length < nb) throw new Error('Pas assez de questions disponibles.');
+
+  return shuffle(pool).filter(isValidQuestion).slice(0, nb).map(q => ({
+    cat:     q.category || 'Culture générale',
+    q:       q.question_fr.trim(),
+    answers: q.answers_fr,
+    correct: q.correct_index,
+  }));
 }
 
 // ══════════════════════════════════════════
@@ -1014,8 +1087,8 @@ async function startChronoMode(code, io) {
   let remaining = Math.ceil((room.chronoDuration || 120000) / 1000);
   room.chronoCountdown = setInterval(() => {
     remaining--;
-    io.to(code).emit('chrono_countdown', { remaining });
-    if (remaining <= 0) clearInterval(room.chronoCountdown);
+    if (remaining >= 0) io.to(code).emit('chrono_countdown', { remaining });
+    if (remaining <= 0) { clearInterval(room.chronoCountdown); room.chronoCountdown = null; }
   }, 1000);
 }
 
