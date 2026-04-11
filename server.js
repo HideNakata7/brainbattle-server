@@ -244,23 +244,39 @@ async function fetchQuestions(nb, category, difficulty) {
     if (catName) query = query.ilike('category', '%' + catName + '%');
     if (difficulty && ['easy','medium','hard'].includes(difficulty)) query = query.eq('difficulty', difficulty);
 
-    const offset = Math.floor(Math.random() * 500);
-    const { data } = await query.range(offset, offset + nb * 5 - 1);
-
-    if (data && data.length >= nb) {
-      return shuffle(data).slice(0, nb).map(q => ({
-        cat:     q.category || 'Culture générale',
-        q:       q.question_fr.trim(),
-        answers: q.answers_fr,
-        correct: q.correct_index
+    // 3 requêtes avec offsets aléatoires pour maximiser la variété
+    const pool = nb * 10;
+    const totalEstimate = 33000;
+    let allResults = [];
+    for (let i = 0; i < 3 && allResults.length < pool; i++) {
+      const offset = Math.floor(Math.random() * Math.max(1, totalEstimate - pool));
+      let q2 = supa.from('translated_questions')
+        .select('category, question_fr, answers_fr, correct_index')
+        .not('question_fr', 'is', null);
+      if (catName) q2 = q2.ilike('category', '%' + catName + '%');
+      if (difficulty && ['easy','medium','hard'].includes(difficulty)) q2 = q2.eq('difficulty', difficulty);
+      const { data: d } = await q2.range(offset, offset + pool - 1);
+      if (d) allResults.push(...d);
+    }
+    // Dédoublonner
+    const seen = new Set();
+    const unique = shuffle(allResults).filter(q => {
+      if (!q.question_fr || seen.has(q.question_fr)) return false;
+      seen.add(q.question_fr); return true;
+    });
+    if (unique.length >= nb) {
+      return unique.slice(0, nb).map(q => ({
+        cat: q.category || 'Culture générale', q: q.question_fr.trim(),
+        answers: q.answers_fr, correct: q.correct_index
       }));
     }
 
     // Tentative sans filtres
+    const fallbackOffset = Math.floor(Math.random() * Math.max(1, totalEstimate - pool));
     const { data: d2 } = await supa.from('translated_questions')
       .select('category, question_fr, answers_fr, correct_index')
       .not('question_fr', 'is', null)
-      .limit(nb * 5);
+      .range(fallbackOffset, fallbackOffset + nb * 5 - 1);
     if (d2 && d2.length >= nb) {
       return shuffle(d2).slice(0, nb).map(q => ({
         cat: q.category || 'Culture générale', q: q.question_fr.trim(),
