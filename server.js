@@ -238,47 +238,28 @@ async function fetchQuestions(nb, category, difficulty) {
   // ── Tentative 1 : Supabase FR ──
   try {
     const catName = (category && category !== '0') ? (CAT_MAP[String(category)] || category) : null;
-    let query = supa.from('translated_questions')
-      .select('category, question_fr, answers_fr, correct_index')
-      .not('question_fr', 'is', null);
-    if (catName) query = query.ilike('category', '%' + catName + '%');
-    if (difficulty && ['easy','medium','hard'].includes(difficulty)) query = query.eq('difficulty', difficulty);
+    const diffValue = (difficulty && ['easy','medium','hard'].includes(difficulty)) ? difficulty : null;
 
-    // 3 requêtes avec offsets aléatoires pour maximiser la variété
-    const pool = nb * 10;
-    const totalEstimate = 33000;
-    let allResults = [];
-    for (let i = 0; i < 3 && allResults.length < pool; i++) {
-      const offset = Math.floor(Math.random() * Math.max(1, totalEstimate - pool));
-      let q2 = supa.from('translated_questions')
-        .select('category, question_fr, answers_fr, correct_index')
-        .not('question_fr', 'is', null);
-      if (catName) q2 = q2.ilike('category', '%' + catName + '%');
-      if (difficulty && ['easy','medium','hard'].includes(difficulty)) q2 = q2.eq('difficulty', difficulty);
-      const { data: d } = await q2.range(offset, offset + pool - 1);
-      if (d) allResults.push(...d);
-    }
-    // Dédoublonner
-    const seen = new Set();
-    const unique = shuffle(allResults).filter(q => {
-      if (!q.question_fr || seen.has(q.question_fr)) return false;
-      seen.add(q.question_fr); return true;
+    // Appel RPC avec vrai ORDER BY random() côté PostgreSQL
+    const { data, error } = await supa.rpc('get_random_questions', {
+      cat_filter: catName,
+      diff_filter: diffValue,
+      num_questions: nb
     });
-    if (unique.length >= nb) {
-      return unique.slice(0, nb).map(q => ({
+
+    if (!error && data && data.length >= nb) {
+      return data.slice(0, nb).map(q => ({
         cat: q.category || 'Culture générale', q: q.question_fr.trim(),
         answers: q.answers_fr, correct: q.correct_index
       }));
     }
 
-    // Tentative sans filtres
-    const fallbackOffset = Math.floor(Math.random() * Math.max(1, totalEstimate - pool));
-    const { data: d2 } = await supa.from('translated_questions')
-      .select('category, question_fr, answers_fr, correct_index')
-      .not('question_fr', 'is', null)
-      .range(fallbackOffset, fallbackOffset + nb * 5 - 1);
+    // Fallback sans filtres
+    const { data: d2 } = await supa.rpc('get_random_questions', {
+      cat_filter: null, diff_filter: null, num_questions: nb
+    });
     if (d2 && d2.length >= nb) {
-      return shuffle(d2).slice(0, nb).map(q => ({
+      return d2.slice(0, nb).map(q => ({
         cat: q.category || 'Culture générale', q: q.question_fr.trim(),
         answers: q.answers_fr, correct: q.correct_index
       }));
