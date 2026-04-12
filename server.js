@@ -247,11 +247,14 @@ async function fetchQuestions(nb, category, difficulty) {
       num_questions: nb
     });
 
+    if (error) console.warn('RPC get_random_questions error:', error.message);
     if (!error && data && data.length >= nb) {
-      return data.slice(0, nb).map(q => ({
-        cat: q.category || 'Culture générale', q: q.question_fr.trim(),
-        answers: q.answers_fr, correct: q.correct_index
-      }));
+      return data.slice(0, nb).map(q => {
+        // answers_fr peut être un string JSON ou un array selon le type de colonne
+        let answers = q.answers_fr;
+        if (typeof answers === 'string') { try { answers = JSON.parse(answers); } catch(e) {} }
+        return { cat: q.category || 'Culture générale', q: q.question_fr.trim(), answers, correct: q.correct_index };
+      });
     }
 
     // Fallback sans filtres
@@ -259,10 +262,11 @@ async function fetchQuestions(nb, category, difficulty) {
       cat_filter: null, diff_filter: null, num_questions: nb
     });
     if (d2 && d2.length >= nb) {
-      return d2.slice(0, nb).map(q => ({
-        cat: q.category || 'Culture générale', q: q.question_fr.trim(),
-        answers: q.answers_fr, correct: q.correct_index
-      }));
+      return d2.slice(0, nb).map(q => {
+        let answers = q.answers_fr;
+        if (typeof answers === 'string') { try { answers = JSON.parse(answers); } catch(e) {} }
+        return { cat: q.category || 'Culture générale', q: q.question_fr.trim(), answers, correct: q.correct_index };
+      });
     }
   } catch(e) {
     console.warn('Supabase fetch error, falling back to OpenTDB:', e.message);
