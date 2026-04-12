@@ -822,7 +822,7 @@ function endGame(code) {
         const player = room.players[p.id];
         const playerTeam = player?.team;
         p.won = playerTeam === winner;
-        p.eloChange = p.won ? ELO_TABLE[getRankName(p.elo||1000)]?.win : ELO_TABLE[getRankName(p.elo||1000)]?.loss;
+        p.eloChange = p.won ? ELO_TABLE[getRankName(p.elo||0)]?.win : ELO_TABLE[getRankName(p.elo||0)]?.loss;
       });
     }
   }
