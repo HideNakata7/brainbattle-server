@@ -641,13 +641,32 @@ io.on('connection', (socket) => {
     const player = room.players[socket.id];
     if (!player) return;
 
-    // Check time remaining
     const elapsed = Date.now() - (room.chronoStartTime || Date.now());
     if (elapsed >= (room.chronoDuration || 120000)) return;
 
-    // Will be handled by sendChronoQuestion which already knows the correct answer
-    // The question was sent per-player so we need to track it
-    // For now emit back — client handles correctness check
+    // Server-side scoring using stored correct answer
+    const correctIdx = room.chronoCurrentAnswers?.[socket.id];
+    const isCorrect = (correctIdx !== undefined && answerIndex === correctIdx);
+    if (isCorrect) {
+      player.combo = (player.combo || 0) + 1;
+      const comboBonus = player.combo >= 10 ? 100 : player.combo >= 5 ? 50 : player.combo >= 2 ? 25 : 0;
+      const pts = 50 + comboBonus;
+      player.chronoScore = (player.chronoScore || 0) + pts;
+      player.correct = (player.correct || 0) + 1;
+    } else {
+      player.combo = 0;
+    }
+
+    // Send result to player
+    socket.emit('chrono_result', { correct: isCorrect, score: player.chronoScore || 0, combo: player.combo || 0, correctIndex: correctIdx });
+
+    // Update scores for all
+    const scores = Object.entries(room.players).map(([id, p]) => ({
+      id, name: p.name, avatar: p.avatar, score: p.chronoScore || 0, combo: p.combo || 0
+    })).sort((a,b) => b.score - a.score);
+    io.to(code).emit('chrono_scores_update', { scores });
+
+    // Send next question
     sendChronoQuestion(code, socket.id, io);
   });
 
@@ -942,6 +961,13 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🚀 Mind Impact Server lancé sur le port ${PORT}`);
 });
+
+// Periodic matchmaking check (fixes starvation when no new player joins)
+setInterval(() => {
+  Object.keys(mmQueues).forEach(mode => {
+    if (mmQueues[mode].length >= 2) tryMatchmaking(mode, io);
+  });
+}, 10000);
 
 // ══════════════════════════════════════════
 //  MATCHMAKING ÉQUIPE CLASSÉE
@@ -1261,10 +1287,12 @@ async function sendChronoQuestion(code, playerId, io) {
     const q = qs[0];
     const s = io.sockets.sockets.get(playerId);
     if (s) {
+      // Store correct answer server-side (don't send to client to prevent cheating)
+      if (!room.chronoCurrentAnswers) room.chronoCurrentAnswers = {};
+      room.chronoCurrentAnswers[playerId] = q.correct;
       s.emit('chrono_question', {
         q:       q.q || q.question,
         answers: q.answers,
-        correct: q.correct,
         cat:     q.cat || q.category,
         timeLeft: Math.max(0, Math.ceil(((room.chronoDuration||120000) - elapsed) / 1000)),
       });
