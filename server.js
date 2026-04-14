@@ -436,7 +436,9 @@ io.on('connection', (socket) => {
     const q       = room.questions[questionIndex];
     const correct = answerIndex === q.correct;
     const dur     = 20;
-    const pts     = correct ? Math.round(100 + (timeLeft / dur) * 100) : 0;
+    // Server-side time validation: cap timeLeft to prevent cheating
+    const safeTimeLeft = Math.max(0, Math.min(dur, typeof timeLeft === 'number' ? timeLeft : 0));
+    const pts     = correct ? Math.round(100 + (safeTimeLeft / dur) * 100) : 0;
 
     room.answers[socket.id] = { answerIndex, correct, pts, timeLeft };
     if (correct) player.score += pts;
@@ -603,9 +605,18 @@ io.on('connection', (socket) => {
       const room = rooms[pdata.code];
       if (room) {
         delete room.players[socket.id];
+        delete room.answers[socket.id];
         io.to(pdata.code).emit('player_left', {
           name: pdata.name, room: sanitizeRoom(room)
         });
+        // Check if all remaining players have answered after disconnect
+        if (room.status === 'playing') {
+          const alivePlayers = Object.values(room.players).filter(p => p.alive !== false);
+          const answeredCount = Object.keys(room.answers || {}).length;
+          if (alivePlayers.length > 0 && answeredCount >= alivePlayers.length) {
+            nextQuestion(pdata.code);
+          }
+        }
         // If host left and room not empty, assign new host
         if (room.host === socket.id) {
           const remaining = Object.keys(room.players);
@@ -780,6 +791,10 @@ function sendQuestion(code) {
 function nextQuestion(code) {
   const room = rooms[code];
   if (!room) return;
+  // Guard against double-call (timeout + all-answered race)
+  if (room._advancing) return;
+  room._advancing = true;
+  setTimeout(() => { if (rooms[code]) rooms[code]._advancing = false; }, 500);
 
   // Reveal correct answer to all
   const q = room.questions[room.currentQ];
