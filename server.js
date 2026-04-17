@@ -206,6 +206,20 @@ app.post('/create-checkout-session', async (req, res) => {
 // ══════════════════════════════════════════
 //  UTILITAIRES
 // ══════════════════════════════════════════
+function normalizeAnswer(s) {
+  return (s || '').toString().toLowerCase().trim()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^\w\s]/g,'').replace(/\s+/g,' ');
+}
+function isOpenAnswerCorrect(input, expected) {
+  const a = normalizeAnswer(input);
+  const b = normalizeAnswer(expected);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (b.split(' | ').some(x => x.trim() === a)) return true;
+  return false;
+}
+
 function genCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -438,7 +452,7 @@ io.on('connection', (socket) => {
   });
 
   // ── RÉPONDRE ──
-  socket.on('answer', ({ code, questionIndex, answerIndex, timeLeft }) => {
+  socket.on('answer', ({ code, questionIndex, answerIndex, timeLeft, openAnswer }) => {
     const room = rooms[code];
     if (!room || room.status !== 'playing') return;
     if (room.currentQ !== questionIndex) return;
@@ -448,13 +462,21 @@ io.on('connection', (socket) => {
     if (room.answers[socket.id] !== undefined) return;
 
     const q       = room.questions[questionIndex];
-    const correct = answerIndex === q.correct;
+    let correct   = false;
+    let finalIdx  = answerIndex;
+    // Open answer validation (server-side to prevent cheating)
+    if (typeof openAnswer === 'string' && q.answers && q.answers.length === 1) {
+      correct = isOpenAnswerCorrect(openAnswer, q.answers[q.correct]);
+      finalIdx = correct ? q.correct : -1;
+    } else {
+      correct = answerIndex === q.correct;
+    }
     const dur     = 20;
     // Server-side time validation: cap timeLeft to prevent cheating
     const safeTimeLeft = Math.max(0, Math.min(dur, typeof timeLeft === 'number' ? timeLeft : 0));
     const pts     = correct ? Math.round(100 + (safeTimeLeft / dur) * 100) : 0;
 
-    room.answers[socket.id] = { answerIndex, correct, pts, timeLeft };
+    room.answers[socket.id] = { answerIndex: finalIdx, correct, pts, timeLeft, openAnswer };
     if (correct) player.score += pts;
 
     // Team mode: add points to team score
@@ -649,7 +671,7 @@ io.on('connection', (socket) => {
   });
 
   // ── CHRONO ANSWER ──
-  socket.on('chrono_answer', ({ code, answerIndex }) => {
+  socket.on('chrono_answer', ({ code, answerIndex, openAnswer }) => {
     const room = rooms[code];
     if (!room || room.mode !== 'chrono' || room.status !== 'playing') return;
     const player = room.players[socket.id];
@@ -660,7 +682,13 @@ io.on('connection', (socket) => {
 
     // Server-side scoring using stored correct answer
     const correctIdx = room.chronoCurrentAnswers?.[socket.id];
-    const isCorrect = (correctIdx !== undefined && answerIndex === correctIdx);
+    const expectedAnswer = room.chronoCurrentExpected?.[socket.id];
+    let isCorrect = false;
+    if (typeof openAnswer === 'string' && expectedAnswer) {
+      isCorrect = isOpenAnswerCorrect(openAnswer, expectedAnswer);
+    } else {
+      isCorrect = (correctIdx !== undefined && answerIndex === correctIdx);
+    }
     if (isCorrect) {
       player.combo = (player.combo || 0) + 1;
       const comboBonus = player.combo >= 10 ? 100 : player.combo >= 5 ? 50 : player.combo >= 2 ? 25 : 0;
@@ -1306,7 +1334,9 @@ async function sendChronoQuestion(code, playerId, io) {
     if (s) {
       // Store correct answer server-side (don't send to client to prevent cheating)
       if (!room.chronoCurrentAnswers) room.chronoCurrentAnswers = {};
+      if (!room.chronoCurrentExpected) room.chronoCurrentExpected = {};
       room.chronoCurrentAnswers[playerId] = q.correct;
+      room.chronoCurrentExpected[playerId] = q.answers ? q.answers[q.correct] : null;
       s.emit('chrono_question', {
         q:       q.q || q.question,
         answers: q.answers,
