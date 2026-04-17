@@ -26,9 +26,15 @@ const app    = express();
 const server = http.createServer(app);
 const ALLOWED_ORIGINS = [
   'https://brainbattle-client.vercel.app',
+  'https://mindimpact.online',
+  'https://www.mindimpact.online',
+  'https://brainbattle.fr',
+  'https://www.brainbattle.fr',
   'http://localhost:3000',
   'http://localhost:5500',
   'http://127.0.0.1:5500',
+  'capacitor://localhost',
+  'http://localhost'
 ];
 const io     = new Server(server, {
   cors: { origin: ALLOWED_ORIGINS, methods: ['GET','POST'] }
