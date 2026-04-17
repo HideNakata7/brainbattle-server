@@ -107,13 +107,15 @@ app.get('/api/purchases/:userId', async (req, res) => {
     if (!userId) { res.status(400).json({ error: 'Missing userId' }); return; }
 
     // Verify auth token
+    // Strict auth required — token must match userId
     const authHeader = req.headers.authorization;
-    if (authHeader) {
-      const token = authHeader.replace('Bearer ', '');
-      const { data: { user }, error: authError } = await supa.auth.getUser(token);
-      if (authError || !user || user.id !== userId) {
-        res.status(403).json({ error: 'Unauthorized' }); return;
-      }
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Authentication required' }); return;
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supa.auth.getUser(token);
+    if (authError || !user || user.id !== userId) {
+      res.status(403).json({ error: 'Unauthorized' }); return;
     }
 
     const { data, error } = await supa.from('purchases')
@@ -331,6 +333,9 @@ io.on('connection', (socket) => {
 
   // ── CRÉER UN SALON ──
   socket.on('create_room', ({ name, avatar, mode, category, difficulty, maxQ }) => {
+    if (!rateLimitSocket(socket.id, 'create_room', 5)) return;
+    if (typeof name !== 'string' || name.length > 30) return;
+    if (avatar && (typeof avatar !== 'string' || avatar.length > 50)) return;
     const code = genCode();
     rooms[code] = {
       code, host: socket.id,
@@ -353,6 +358,9 @@ io.on('connection', (socket) => {
 
   // ── REJOINDRE UN SALON ──
   socket.on('join_room', ({ code, name, avatar }) => {
+    if (!rateLimitSocket(socket.id, 'join_room', 10)) return;
+    if (typeof name !== 'string' || name.length > 30) return;
+    if (avatar && (typeof avatar !== 'string' || avatar.length > 50)) return;
     const room = rooms[code];
     if (!room) { socket.emit('error', { msg: 'Salon introuvable. Vérifie le code.' }); return; }
     if (room.status !== 'waiting') { socket.emit('error', { msg: 'La partie a déjà commencé.' }); return; }
@@ -690,6 +698,9 @@ io.on('connection', (socket) => {
 
   // ── MATCHMAKING ──
   socket.on('join_matchmaking', ({ mode, name, avatar, userId, groupCode, elo }) => {
+    if (!rateLimitSocket(socket.id, 'join_matchmaking', 10)) return;
+    if (typeof name !== 'string' || name.length > 30) return;
+    if (avatar && (typeof avatar !== 'string' || avatar.length > 50)) return;
     const data = { socketId:socket.id, name, avatar, userId, groupCode, elo:elo||1, mode, joinedAt: Date.now() };
     Object.keys(mmQueues).forEach(m => {
       const idx = mmQueues[m].findIndex(q=>q.socketId===socket.id);
