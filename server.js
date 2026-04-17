@@ -208,8 +208,10 @@ app.post('/create-checkout-session', async (req, res) => {
 // ══════════════════════════════════════════
 function normalizeAnswer(s) {
   return (s || '').toString().toLowerCase().trim()
+    .replace(/œ/g,'oe').replace(/æ/g,'ae').replace(/ø/g,'o').replace(/ß/g,'ss')
     .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
-    .replace(/[^\w\s]/g,'').replace(/\s+/g,' ');
+    .replace(/[^\p{L}\p{N}\s]/gu,'')
+    .replace(/\s+/g,' ').trim();
 }
 function isOpenAnswerCorrect(input, expected) {
   const a = normalizeAnswer(input);
