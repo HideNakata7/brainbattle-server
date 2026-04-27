@@ -916,7 +916,8 @@ io.on('connection', (socket) => {
     } else {
       correct = answerIndex === q.correct;
     }
-    const dur     = 20;
+    // Durée selon config host (5-60s, défaut 20s)
+    const dur     = (room.timer_sec && room.timer_sec >= 5 && room.timer_sec <= 60) ? room.timer_sec : 20;
     // Server-side time validation: cap timeLeft to prevent cheating
     const safeTimeLeft = Math.max(0, Math.min(dur, typeof timeLeft === 'number' ? timeLeft : 0));
     const pts     = correct ? Math.round(100 + (safeTimeLeft / dur) * 100) : 0;
@@ -996,30 +997,26 @@ io.on('connection', (socket) => {
   // ── DÉCONNEXION ──
   // ── FRIENDS & ONLINE STATUS ──
   socket.on('user_online', async ({ userId, username, token }) => {
-    // Validate userId with Supabase auth token
-    if (token) {
-      try {
-        const { data: { user }, error } = await supa.auth.getUser(token);
-        if (!error && user && user.id === userId) {
-          socket.userId = userId;
-          socket.username = username;
-          socket.verified = true;
-        } else {
-          socket.userId = userId;
-          socket.username = username;
-          socket.verified = false;
-        }
-      } catch(e) {
-        socket.userId = userId;
-        socket.username = username;
+    // Sécu : on n'enregistre socket.userId QUE si le token est valide.
+    // Sans ça, n'importe qui pouvait se faire passer pour un autre userId
+    // dans les events qui ne checkent pas socket.verified.
+    if (!token || !userId) {
+      socket.verified = false;
+      return; // pas de token → on ne broadcast rien et on ne stocke pas userId
+    }
+    try {
+      const { data: { user }, error } = await supa.auth.getUser(token);
+      if (error || !user || user.id !== userId) {
         socket.verified = false;
+        return;
       }
-    } else {
       socket.userId = userId;
       socket.username = username;
+      socket.verified = true;
+      socket.broadcast.emit('friend_online', { userId });
+    } catch(e) {
       socket.verified = false;
     }
-    socket.broadcast.emit('friend_online', { userId });
   });
 
   socket.on('friend_request', ({ toUserId, fromUsername, fromAvatar }) => {
@@ -1185,6 +1182,7 @@ io.on('connection', (socket) => {
 
   // ── HOST CONFIG ──
   socket.on('host_config', ({ code, mode, category, difficulty, maxQ, timer }) => {
+    if (!rateLimitSocket(socket.id, 'host_config', 30)) return;
     const room = rooms[code];
     if (!room || room.host !== socket.id) return;
     const validModes = ['friends','royale','team','chrono','tactical'];
