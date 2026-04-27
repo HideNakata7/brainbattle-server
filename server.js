@@ -158,6 +158,70 @@ app.get('/api/purchases/:userId', async (req, res) => {
   }
 });
 
+// ── REPORT QUESTION (signalement par les joueurs) ──
+const REPORT_REASONS = ['wrong_answer','bad_question','offensive','typo','other'];
+app.post('/api/report-question', async (req, res) => {
+  try {
+    const { questionId, reason, comment } = req.body || {};
+    if (!questionId || typeof questionId !== 'string') {
+      res.status(400).json({ error: 'invalid_question_id' }); return;
+    }
+    if (!REPORT_REASONS.includes(reason)) {
+      res.status(400).json({ error: 'invalid_reason' }); return;
+    }
+    const cleanComment = typeof comment === 'string' ? comment.slice(0, 500) : null;
+
+    // userId optionnel (anonyme accepté)
+    let userId = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.replace('Bearer ', '');
+      const { data: { user } } = await supa.auth.getUser(token);
+      if (user) userId = user.id;
+    }
+
+    const { error } = await supa.from('question_reports').insert({
+      question_id: questionId,
+      user_id: userId,
+      reason,
+      comment: cleanComment
+    });
+    if (error) {
+      console.error('Report insert error:', error.message);
+      res.status(500).json({ error: 'db_error' }); return;
+    }
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('Report endpoint error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ── ADMIN : liste des questions signalées ──
+app.get('/api/admin/reports', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'auth_required' }); return;
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supa.auth.getUser(token);
+    if (error || !user) { res.status(403).json({ error: 'unauthorized' }); return; }
+    const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || '').split(',').filter(Boolean);
+    if (!ADMIN_USER_IDS.includes(user.id)) { res.status(403).json({ error: 'admin_only' }); return; }
+
+    // Agrégation : groupe par question_id, compte les reports
+    const { data, error: e2 } = await supa.from('question_reports')
+      .select('question_id, reason, comment, created_at, translated_questions(question_fr, answers_fr, correct_index, category)')
+      .order('created_at', { ascending: false })
+      .limit(500);
+    if (e2) { res.status(500).json({ error: e2.message }); return; }
+    res.json({ reports: data || [] });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── VALIDATE PSEUDO (modération à la création/changement) ──
 app.post('/api/validate-pseudo', async (req, res) => {
   try {
@@ -332,7 +396,7 @@ async function fetchQuestions(nb, category, difficulty) {
         // answers_fr peut être un string JSON ou un array selon le type de colonne
         let answers = q.answers_fr;
         if (typeof answers === 'string') { try { answers = JSON.parse(answers); } catch(e) {} }
-        return { cat: q.category || 'Culture générale', q: q.question_fr.trim(), answers, correct: q.correct_index };
+        return { id: q.id, cat: q.category || 'Culture générale', q: q.question_fr.trim(), answers, correct: q.correct_index };
       });
     }
 
@@ -344,7 +408,7 @@ async function fetchQuestions(nb, category, difficulty) {
       return d2.slice(0, nb).map(q => {
         let answers = q.answers_fr;
         if (typeof answers === 'string') { try { answers = JSON.parse(answers); } catch(e) {} }
-        return { cat: q.category || 'Culture générale', q: q.question_fr.trim(), answers, correct: q.correct_index };
+        return { id: q.id, cat: q.category || 'Culture générale', q: q.question_fr.trim(), answers, correct: q.correct_index };
       });
     }
   } catch(e) {
@@ -901,6 +965,7 @@ function sendQuestion(code) {
     total:   room.questions.length,
     cat:     q.cat,
     q:       q.q,
+    qid:     q.id || null,
     answers: q.answers,
     players: sanitizePlayers(room.players)
   });
@@ -1416,6 +1481,7 @@ async function sendChronoQuestion(code, playerId, io) {
       room.chronoCurrentExpected[playerId] = q.answers ? q.answers[q.correct] : null;
       s.emit('chrono_question', {
         q:       q.q || q.question,
+        qid:     q.id || null,
         answers: q.answers,
         cat:     q.cat || q.category,
         timeLeft: Math.max(0, Math.ceil(((room.chronoDuration||120000) - elapsed) / 1000)),
