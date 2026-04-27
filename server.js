@@ -324,6 +324,88 @@ app.post('/api/profile/claim-level-rewards', httpRateLimit(60), async (req, res)
   }
 });
 
+// ── MIND PASS XP (validation server-side du daily cap) ──
+//
+// Le client appelle cet endpoint quand un joueur gagne du XP en jeu.
+// Le serveur vérifie le daily cap, débite, et renvoie le nouveau total + level.
+// pass_daily_xp en BDD : JSONB { "YYYY-MM-DD": xp_credited_today }
+//
+const PASS_DAILY_CAP = 1000;       // identique au client
+const PASS_XP_PER_LEVEL = 1000;
+const PASS_TOTAL_LEVELS = 50;
+
+app.post('/api/profile/credit-pass-xp', httpRateLimit(120), async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'auth_required' }); return;
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authErr } = await supa.auth.getUser(token);
+    if (authErr || !user) { res.status(403).json({ error: 'unauthorized' }); return; }
+
+    const amount = parseInt(req.body?.amount, 10);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 5000) {
+      res.status(400).json({ error: 'invalid_amount' }); return;
+    }
+
+    // Lit le profil actuel
+    const { data: prof, error: e1 } = await supaAdmin.from('profiles')
+      .select('pass_xp_total, pass_daily_xp')
+      .eq('id', user.id).single();
+    if (e1 || !prof) { res.status(404).json({ error: 'profile_not_found' }); return; }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyMap = (prof.pass_daily_xp && typeof prof.pass_daily_xp === 'object') ? prof.pass_daily_xp : {};
+    const usedToday = parseInt(dailyMap[today], 10) || 0;
+    const remaining = Math.max(0, PASS_DAILY_CAP - usedToday);
+    const credited = Math.min(amount, remaining);
+
+    if (credited <= 0) {
+      const oldXP = prof.pass_xp_total | 0;
+      res.json({
+        credited: 0, capped: true,
+        xp_total: oldXP,
+        level: Math.min(Math.floor(oldXP / PASS_XP_PER_LEVEL), PASS_TOTAL_LEVELS),
+        daily_used: usedToday,
+        daily_cap: PASS_DAILY_CAP
+      });
+      return;
+    }
+
+    const newTotal = (prof.pass_xp_total | 0) + credited;
+    // Garde uniquement les 7 derniers jours dans la map (cleanup auto)
+    const cleanedDaily = {};
+    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    for (const [k, v] of Object.entries(dailyMap)) {
+      if (new Date(k).getTime() >= cutoff) cleanedDaily[k] = v;
+    }
+    cleanedDaily[today] = usedToday + credited;
+
+    const { error: e2 } = await supaAdmin.from('profiles')
+      .update({ pass_xp_total: newTotal, pass_daily_xp: cleanedDaily })
+      .eq('id', user.id);
+    if (e2) { res.status(500).json({ error: e2.message }); return; }
+
+    const newLevel = Math.min(Math.floor(newTotal / PASS_XP_PER_LEVEL), PASS_TOTAL_LEVELS);
+    const oldLevel = Math.min(Math.floor((prof.pass_xp_total | 0) / PASS_XP_PER_LEVEL), PASS_TOTAL_LEVELS);
+
+    res.json({
+      credited,
+      capped: credited < amount,
+      xp_total: newTotal,
+      level: newLevel,
+      level_up: newLevel > oldLevel,
+      old_level: oldLevel,
+      daily_used: usedToday + credited,
+      daily_cap: PASS_DAILY_CAP
+    });
+  } catch(e) {
+    console.error('credit-pass-xp error:', e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // ── CHECK ANSWER (validation server-side pour modes solo/survie/infini) ──
 //
 // Le client envoie l'ID de la question + sa réponse, le serveur consulte la BDD
