@@ -7,6 +7,16 @@ const { createClient } = require('@supabase/supabase-js');
 try { require('dotenv').config(); } catch(e) {}
 const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;
 
+// Modération & détection de triche (nécessite ANTHROPIC_API_KEY)
+let moderation, cheatDetection;
+try {
+  moderation = require('./moderation');
+  cheatDetection = require('./cheat_detection');
+  if (!process.env.ANTHROPIC_API_KEY) console.warn('⚠ ANTHROPIC_API_KEY manquant — modération en mode pre-filter seul.');
+} catch(e) {
+  console.warn('⚠ Modules moderation/cheat_detection non chargés:', e.message);
+}
+
 // Supabase — questions FR
 const supa = createClient(
   'https://gqjcmjncyhcioxvjkasc.supabase.co',
@@ -145,6 +155,51 @@ app.get('/api/purchases/:userId', async (req, res) => {
   } catch(e) {
     console.error('Purchases API error:', e);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── VALIDATE PSEUDO (modération à la création/changement) ──
+app.post('/api/validate-pseudo', async (req, res) => {
+  try {
+    const { pseudo } = req.body || {};
+    if (!pseudo || typeof pseudo !== 'string') {
+      res.status(400).json({ ok: false, reason: 'invalid_input' }); return;
+    }
+    if (!moderation) {
+      res.json({ ok: true, source: 'no_moderation' }); return;
+    }
+    const verdict = await moderation.moderatePseudo(pseudo);
+    res.json(verdict);
+  } catch(e) {
+    console.error('Pseudo validation error:', e.message);
+    res.status(500).json({ ok: false, reason: 'server_error' });
+  }
+});
+
+// ── ADMIN : récupère les comptes flaggués pour triche (auth requise) ──
+app.get('/api/admin/cheat-flagged', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Authentication required' }); return;
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error } = await supa.auth.getUser(token);
+    if (error || !user) { res.status(403).json({ error: 'Unauthorized' }); return; }
+
+    // TODO : remplacer par une vraie vérification admin (table admins ou rôle Supabase)
+    const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || '').split(',').filter(Boolean);
+    if (!ADMIN_USER_IDS.includes(user.id)) {
+      res.status(403).json({ error: 'Admin only' }); return;
+    }
+
+    if (!cheatDetection) { res.json({ flagged: [], summary: null }); return; }
+    res.json({
+      flagged: cheatDetection.getFlaggedUsers(50),
+      summary: cheatDetection.getStatsSummary()
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -481,6 +536,12 @@ io.on('connection', (socket) => {
     room.answers[socket.id] = { answerIndex: finalIdx, correct, pts, timeLeft, openAnswer };
     if (correct) player.score += pts;
 
+    // Hook détection de triche
+    if (cheatDetection && socket.userId) {
+      const responseMs = Math.max(0, (20 - safeTimeLeft) * 1000);
+      cheatDetection.recordAnswer(socket.userId, correct, responseMs, room.difficulty || 'medium');
+    }
+
     // Team mode: add points to team score
     if (room.mode === 'team') {
       const team = player.team;
@@ -593,9 +654,16 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('private_msg', ({ toUserId, content, fromUsername, fromAvatar }) => {
+  socket.on('private_msg', async ({ toUserId, content, fromUsername, fromAvatar }) => {
     if (!rateLimitSocket(socket.id, 'private_msg', 15)) return;
     if (!content || typeof content !== 'string' || !content.trim() || content.length > 200) return;
+    if (moderation) {
+      const verdict = await moderation.moderateChatMessage(content);
+      if (!verdict.ok) {
+        socket.emit('private_msg_blocked', { reason: verdict.reason });
+        return;
+      }
+    }
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
         s.emit('private_msg_received', { content, fromUsername, fromAvatar, fromUserId: socket.userId });
@@ -615,9 +683,16 @@ io.on('connection', (socket) => {
   });
 
   // Chat
-  socket.on('chat_msg', ({ code, name, msg }) => {
+  socket.on('chat_msg', async ({ code, name, msg }) => {
     if (!rateLimitSocket(socket.id, 'chat_msg', 20)) return;
     if (!msg || typeof msg !== 'string' || !msg.trim() || msg.length > 120) return;
+    if (moderation) {
+      const verdict = await moderation.moderateChatMessage(msg);
+      if (!verdict.ok) {
+        socket.emit('chat_msg_blocked', { reason: verdict.reason });
+        return;
+      }
+    }
     // Broadcast to everyone else in the room
     socket.to(code).emit('chat_msg', { name, msg });
   });
