@@ -67,6 +67,34 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── HTTP rate limiter (in-memory, par IP) ──
+const httpRateLimitData = {}; // ip+route → { count, windowStart }
+function httpRateLimit(maxPerMinute = 60) {
+  return (req, res, next) => {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    const key = ip + ':' + req.path;
+    const now = Date.now();
+    const entry = httpRateLimitData[key];
+    if (!entry || now - entry.windowStart > 60000) {
+      httpRateLimitData[key] = { count: 1, windowStart: now };
+      return next();
+    }
+    entry.count++;
+    if (entry.count > maxPerMinute) {
+      res.status(429).json({ error: 'rate_limited', retry_after: Math.ceil((60000 - (now - entry.windowStart))/1000) });
+      return;
+    }
+    next();
+  };
+}
+// Cleanup périodique (toutes les 10 min, supprime les entrées vieilles)
+setInterval(() => {
+  const cutoff = Date.now() - 120000;
+  for (const k of Object.keys(httpRateLimitData)) {
+    if (httpRateLimitData[k].windowStart < cutoff) delete httpRateLimitData[k];
+  }
+}, 600000);
+
 // Stripe webhook needs raw body — must be BEFORE express.json()
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -123,7 +151,7 @@ app.use(express.json());
 app.get('/', (req, res) => res.send('Mind Impact Server ✅'));
 
 // ── VERIFY PURCHASES (with auth token) ──
-app.get('/api/purchases/:userId', async (req, res) => {
+app.get('/api/purchases/:userId', httpRateLimit(30), async (req, res) => {
   try {
     const { userId } = req.params;
     if (!userId) { res.status(400).json({ error: 'Missing userId' }); return; }
@@ -204,7 +232,7 @@ function getSeasonRewardItems(rankName, seasonNum) {
   return items;
 }
 
-app.post('/api/profile/claim-season-rewards', async (req, res) => {
+app.post('/api/profile/claim-season-rewards', httpRateLimit(10), async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -252,7 +280,7 @@ app.post('/api/profile/claim-season-rewards', async (req, res) => {
 
 // ── CLAIM LEVEL REWARDS (validation server-side) ──
 // Lit le XP/niveau réel et débloque les rewards correspondants.
-app.post('/api/profile/claim-level-rewards', async (req, res) => {
+app.post('/api/profile/claim-level-rewards', httpRateLimit(60), async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -298,7 +326,7 @@ app.post('/api/profile/claim-level-rewards', async (req, res) => {
 
 // ── REPORT QUESTION (signalement par les joueurs) ──
 const REPORT_REASONS = ['wrong_answer','bad_question','offensive','typo','other'];
-app.post('/api/report-question', async (req, res) => {
+app.post('/api/report-question', httpRateLimit(20), async (req, res) => {
   try {
     const { questionId, reason, comment } = req.body || {};
     if (!questionId || typeof questionId !== 'string') {
@@ -361,7 +389,7 @@ app.get('/api/admin/reports', async (req, res) => {
 });
 
 // ── VALIDATE PSEUDO (modération à la création/changement) ──
-app.post('/api/validate-pseudo', async (req, res) => {
+app.post('/api/validate-pseudo', httpRateLimit(20), async (req, res) => {
   try {
     const { pseudo } = req.body || {};
     if (!pseudo || typeof pseudo !== 'string') {
@@ -422,7 +450,7 @@ const STRIPE_PRODUCTS = {
 };
 
 // ── STRIPE CHECKOUT ──
-app.post('/create-checkout-session', async (req, res) => {
+app.post('/create-checkout-session', httpRateLimit(10), async (req, res) => {
   if (!stripe) { res.status(500).json({ error: 'Stripe not configured' }); return; }
   try {
     const { product, userId, username, successUrl, cancelUrl } = req.body;
@@ -848,6 +876,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('friend_accepted', ({ toUserId, fromUsername }) => {
+    if (!socket.verified) return; // Anti-usurpation
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
         s.emit('friend_accepted_notification', { fromUsername });
@@ -857,6 +886,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('private_msg', async ({ toUserId, content, fromUsername, fromAvatar }) => {
+    if (!socket.verified) return; // Anti-usurpation : exige token Supabase valide
     if (!rateLimitSocket(socket.id, 'private_msg', 15)) return;
     if (!content || typeof content !== 'string' || !content.trim() || content.length > 200) return;
     if (moderation) {
@@ -875,6 +905,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('game_invite', ({ toUserId, fromUsername, groupCode, mode }) => {
+    if (!socket.verified) return; // Anti-usurpation
     if (!rateLimitSocket(socket.id, 'game_invite', 10)) return;
     for (const [id, s] of io.sockets.sockets) {
       if (s.userId === toUserId) {
@@ -885,9 +916,13 @@ io.on('connection', (socket) => {
   });
 
   // Chat
-  socket.on('chat_msg', async ({ code, name, msg }) => {
+  socket.on('chat_msg', async ({ code, msg }) => {
     if (!rateLimitSocket(socket.id, 'chat_msg', 20)) return;
     if (!msg || typeof msg !== 'string' || !msg.trim() || msg.length > 120) return;
+    // Récupère le nom depuis l'état serveur (anti-spoof) ; ignore le name du client.
+    const room = rooms[code];
+    const trustedName = room?.players?.[socket.id]?.name;
+    if (!trustedName) return; // pas dans la room → ignore
     if (moderation) {
       const verdict = await moderation.moderateChatMessage(msg);
       if (!verdict.ok) {
@@ -895,8 +930,7 @@ io.on('connection', (socket) => {
         return;
       }
     }
-    // Broadcast to everyone else in the room
-    socket.to(code).emit('chat_msg', { name, msg });
+    socket.to(code).emit('chat_msg', { name: trustedName, msg });
   });
 
   // Emotes
