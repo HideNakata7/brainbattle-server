@@ -324,6 +324,82 @@ app.post('/api/profile/claim-level-rewards', httpRateLimit(60), async (req, res)
   }
 });
 
+// ── CHECK ANSWER (validation server-side pour modes solo/survie/infini) ──
+//
+// Le client envoie l'ID de la question + sa réponse, le serveur consulte la BDD
+// pour la vraie bonne réponse, et renvoie correct: true/false + l'index correct.
+// Anti-retry : un user ne peut répondre qu'1 fois par question (Map TTL 1h).
+//
+const answerSessions = new Map(); // userId+qid → { answered: true, correct, correctIndex, expires }
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of answerSessions) if (v.expires < now) answerSessions.delete(k);
+}, 600000); // cleanup toutes les 10 min
+
+app.post('/api/check-answer', httpRateLimit(120), async (req, res) => {
+  try {
+    // Auth optionnelle : seul les users connectés ont anti-retry tracké.
+    // (Les anon n'ont pas de records de toute façon → pas d'enjeu compétitif)
+    let userId = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.replace('Bearer ', '');
+      const { data: { user } } = await supa.auth.getUser(token);
+      if (user) userId = user.id;
+    }
+
+    const { questionId, userAnswer } = req.body || {};
+    if (!questionId || typeof questionId !== 'string') {
+      res.status(400).json({ error: 'invalid_question_id' }); return;
+    }
+
+    // Anti-retry : seulement si authentifié
+    if (userId) {
+      const sessionKey = userId + ':' + questionId;
+      const existing = answerSessions.get(sessionKey);
+      if (existing) {
+        res.json({ correct: existing.correct, correctIndex: existing.correctIndex, alreadyAnswered: true });
+        return;
+      }
+    }
+
+    // Lookup question
+    const { data: q, error: qErr } = await supa.from('translated_questions')
+      .select('correct_index, answers_fr').eq('id', questionId).single();
+    if (qErr || !q) { res.status(404).json({ error: 'question_not_found' }); return; }
+
+    let answers = q.answers_fr;
+    if (typeof answers === 'string') { try { answers = JSON.parse(answers); } catch(e) {} }
+    if (!Array.isArray(answers)) { res.status(500).json({ error: 'bad_question_data' }); return; }
+
+    const correctIndex = q.correct_index;
+    let correct = false;
+
+    if (typeof userAnswer === 'number') {
+      correct = (userAnswer === correctIndex);
+    } else if (typeof userAnswer === 'string') {
+      // Open answer : compare normalizée à la bonne réponse
+      correct = isOpenAnswerCorrect(userAnswer, answers[correctIndex] || '');
+    } else {
+      res.status(400).json({ error: 'invalid_user_answer' }); return;
+    }
+
+    // Stocke pour anti-retry (uniquement si auth)
+    if (userId) {
+      answerSessions.set(userId + ':' + questionId, {
+        answered: true, correct, correctIndex,
+        expires: Date.now() + 3600000 // 1h
+      });
+    }
+
+    res.json({ correct, correctIndex });
+  } catch(e) {
+    console.error('check-answer error:', e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // ── REPORT QUESTION (signalement par les joueurs) ──
 const REPORT_REASONS = ['wrong_answer','bad_question','offensive','typo','other'];
 app.post('/api/report-question', httpRateLimit(20), async (req, res) => {
