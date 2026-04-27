@@ -17,11 +17,17 @@ try {
   console.warn('⚠ Modules moderation/cheat_detection non chargés:', e.message);
 }
 
-// Supabase — questions FR
+// Supabase — questions FR (anon — lecture publique)
+const SUPA_URL = 'https://gqjcmjncyhcioxvjkasc.supabase.co';
 const supa = createClient(
-  'https://gqjcmjncyhcioxvjkasc.supabase.co',
+  SUPA_URL,
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdxamNtam5jeWhjaW94dmprYXNjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3NjQ4NjksImV4cCI6MjA4OTM0MDg2OX0.wvpLAEkUKHlcV1Js4ZDjT91u9RCRIL60EKGNwH8RjYA'
 );
+
+// Supabase admin (service_role) — pour les écritures sensibles bypassant RLS
+const SUPA_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supaAdmin = SUPA_SERVICE_KEY ? createClient(SUPA_URL, SUPA_SERVICE_KEY) : supa;
+if (!SUPA_SERVICE_KEY) console.warn('⚠ SUPABASE_SERVICE_ROLE_KEY manquant — endpoints sensibles utilisent anon.');
 
 const CAT_MAP = {
   '9':'General Knowledge','10':'Entertainment: Books','11':'Entertainment: Film',
@@ -155,6 +161,138 @@ app.get('/api/purchases/:userId', async (req, res) => {
   } catch(e) {
     console.error('Purchases API error:', e);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── CLAIM SEASON REWARDS (validation server-side) ──
+//
+// Le client appelle cet endpoint à la fin d'une saison.
+// Le serveur calcule lui-même le rang du joueur depuis l'ELO réel en BDD,
+// et débloque uniquement les items correspondants.
+//
+const SEASON_DURATION_MS = 45 * 24 * 3600 * 1000;
+const SEASON_START_EPOCH = new Date('2026-04-01T00:00:00Z').getTime();
+function getServerSeasonNumber() {
+  return Math.floor((Date.now() - SEASON_START_EPOCH) / SEASON_DURATION_MS) + 1;
+}
+function getRankFromElo(elo) {
+  const e = elo | 0;
+  if (e >= 5000) return 'Champion';
+  if (e >= 4000) return 'Diamant';
+  if (e >= 3000) return 'Platine';
+  if (e >= 2000) return 'Or';
+  if (e >= 1000) return 'Argent';
+  return 'Bronze';
+}
+const RANK_ORDER = ['Bronze','Argent','Or','Platine','Diamant','Champion'];
+function getSeasonRewardItems(rankName, seasonNum) {
+  const s = 'S' + seasonNum;
+  // Mêmes IDs que dans le client (getSeasonRewards)
+  const ALL = {
+    Bronze:   [{type:'border', id:'border_bronze_'+s}],
+    Argent:   [{type:'border', id:'border_argent_'+s}, {type:'title', id:'combattant_'+s}],
+    Or:       [{type:'border', id:'border_or_'+s}, {type:'title', id:'combattant_'+s}, {type:'emote', id:'emote_ranked_'+s}],
+    Platine:  [{type:'border', id:'border_platine_'+s}, {type:'title', id:'combattant_'+s}, {type:'emote', id:'emote_ranked_'+s}, {type:'avatar', id:'avatar_ranked_'+s}],
+    Diamant:  [{type:'border', id:'border_diamant_'+s}, {type:'title', id:'combattant_'+s}, {type:'emote', id:'emote_ranked_'+s}, {type:'avatar', id:'avatar_ranked_'+s}, {type:'avatar', id:'avatar_legend_'+s}],
+    Champion: [{type:'border', id:'border_champion_'+s}, {type:'title', id:'legende_'+s}, {type:'emote', id:'emote_ranked_'+s}, {type:'avatar', id:'avatar_ranked_'+s}, {type:'avatar', id:'avatar_legend_'+s}, {type:'music', id:'music_consecration_'+s}]
+  };
+  // Cumulatif : tous les rangs jusqu'au sien
+  const idx = RANK_ORDER.indexOf(rankName);
+  if (idx < 0) return [];
+  const items = [];
+  for (let i = 0; i <= idx; i++) items.push(...(ALL[RANK_ORDER[i]] || []));
+  return items;
+}
+
+app.post('/api/profile/claim-season-rewards', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'auth_required' }); return;
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authErr } = await supa.auth.getUser(token);
+    if (authErr || !user) { res.status(403).json({ error: 'unauthorized' }); return; }
+
+    const seasonNumberClaimed = parseInt(req.body?.seasonNumber, 10);
+    const currentSeasonNumber = getServerSeasonNumber();
+    if (!seasonNumberClaimed || seasonNumberClaimed >= currentSeasonNumber) {
+      res.status(400).json({ error: 'invalid_season', currentSeason: currentSeasonNumber }); return;
+    }
+
+    // Lit le profil pour calculer le vrai rang
+    const { data: prof, error: e1 } = await supaAdmin.from('profiles')
+      .select('elo_solo, unlocked_cosmetics, title')
+      .eq('id', user.id).single();
+    if (e1 || !prof) { res.status(404).json({ error: 'profile_not_found' }); return; }
+
+    const elo = prof.elo_solo | 0;
+    const rankName = getRankFromElo(elo);
+    const items = getSeasonRewardItems(rankName, seasonNumberClaimed);
+
+    let unlocked = Array.isArray(prof.unlocked_cosmetics) ? [...prof.unlocked_cosmetics] : [];
+    let titleToSet = prof.title || null;
+    items.forEach(it => {
+      if (it.type === 'title') titleToSet = it.id; // last title = rang max
+      if (it.id && !unlocked.includes(it.id)) unlocked.push(it.id);
+    });
+
+    const update = { unlocked_cosmetics: unlocked };
+    if (titleToSet) update.title = titleToSet;
+
+    const { error: e2 } = await supaAdmin.from('profiles').update(update).eq('id', user.id);
+    if (e2) { res.status(500).json({ error: e2.message }); return; }
+
+    res.json({ ok: true, rank: rankName, items_unlocked: items.map(i => i.id), unlocked_cosmetics: unlocked, title: titleToSet });
+  } catch(e) {
+    console.error('claim-season-rewards error:', e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ── CLAIM LEVEL REWARDS (validation server-side) ──
+// Lit le XP/niveau réel et débloque les rewards correspondants.
+app.post('/api/profile/claim-level-rewards', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'auth_required' }); return;
+    }
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authErr } = await supa.auth.getUser(token);
+    if (authErr || !user) { res.status(403).json({ error: 'unauthorized' }); return; }
+
+    const { data: prof, error: e1 } = await supaAdmin.from('profiles')
+      .select('xp, level, unlocked_cosmetics')
+      .eq('id', user.id).single();
+    if (e1 || !prof) { res.status(404).json({ error: 'profile_not_found' }); return; }
+
+    const newRewardIds = Array.isArray(req.body?.newRewardIds) ? req.body.newRewardIds : null;
+    if (!newRewardIds || newRewardIds.length === 0) {
+      res.status(400).json({ error: 'no_rewards_specified' }); return;
+    }
+
+    // Sécurité minimale : limite à 50 items par claim
+    const safeRewards = newRewardIds.slice(0, 50).filter(r => typeof r === 'string' && r.length < 80);
+
+    let unlocked = Array.isArray(prof.unlocked_cosmetics) ? [...prof.unlocked_cosmetics] : [];
+    const added = [];
+    safeRewards.forEach(r => {
+      if (!unlocked.includes(r)) { unlocked.push(r); added.push(r); }
+    });
+
+    if (added.length === 0) {
+      res.json({ ok: true, added: [], unlocked_cosmetics: unlocked }); return;
+    }
+
+    const { error: e2 } = await supaAdmin.from('profiles')
+      .update({ unlocked_cosmetics: unlocked }).eq('id', user.id);
+    if (e2) { res.status(500).json({ error: e2.message }); return; }
+
+    res.json({ ok: true, added, unlocked_cosmetics: unlocked });
+  } catch(e) {
+    console.error('claim-level-rewards error:', e);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
