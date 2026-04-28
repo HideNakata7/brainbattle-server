@@ -534,9 +534,9 @@ app.get('/api/admin/reports', async (req, res) => {
     const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || '').split(',').filter(Boolean);
     if (!ADMIN_USER_IDS.includes(user.id)) { res.status(403).json({ error: 'admin_only' }); return; }
 
-    // Agrégation : groupe par question_id, compte les reports
-    const { data, error: e2 } = await supa.from('question_reports')
-      .select('question_id, reason, comment, created_at, translated_questions(question_fr, answers_fr, correct_index, category)')
+    // Utilise supaAdmin (service_role) pour bypass RLS — admin a le droit de tout voir
+    const { data, error: e2 } = await supaAdmin.from('question_reports')
+      .select('id, question_id, reason, comment, status, created_at, translated_questions(question_fr, answers_fr, correct_index, category)')
       .order('created_at', { ascending: false })
       .limit(500);
     if (e2) { res.status(500).json({ error: e2.message }); return; }
