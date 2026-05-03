@@ -15,7 +15,9 @@
     "@supabase/supabase-js": "^2.99.3",
     "cors": "^2.8.6",
     "express": "^5.2.1",
+    "node-cron": "^4.2.1",
     "socket.io": "^4.8.3",
-    "stripe": "^20.4.1"
+    "stripe": "^20.4.1",
+    "web-push": "^3.6.7"
   }
 }

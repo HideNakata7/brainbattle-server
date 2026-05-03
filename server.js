@@ -7,6 +7,25 @@ const { createClient } = require('@supabase/supabase-js');
 try { require('dotenv').config(); } catch(e) {}
 const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;
 
+// ── Web Push ──
+let webpush = null;
+try {
+  webpush = require('web-push');
+  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY;
+  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY;
+  if (VAPID_PUBLIC && VAPID_PRIVATE) {
+    webpush.setVapidDetails('mailto:contact@mindimpact.online', VAPID_PUBLIC, VAPID_PRIVATE);
+    console.log('✅ Web Push initialisé');
+  } else {
+    console.warn('⚠ VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY manquants — push notifications désactivées');
+    webpush = null;
+  }
+} catch(e) { console.warn('⚠ web-push non disponible:', e.message); }
+
+// ── Cron hebdomadaire ──
+let cron = null;
+try { cron = require('node-cron'); } catch(e) { console.warn('⚠ node-cron non disponible'); }
+
 // Modération & détection de triche (nécessite ANTHROPIC_API_KEY)
 let moderation, cheatDetection;
 try {
@@ -1597,6 +1616,112 @@ function registerVoteCategoryHandler(socket, io) {
       finalizeCategoryVote(code, io);
     }
   });
+}
+
+// ══════════════════════════════════════════
+//  WEB PUSH — endpoints + cron hebdo
+// ══════════════════════════════════════════
+
+// Récupère la clé publique VAPID (pour le front)
+app.get('/api/push/vapid-key', (req, res) => {
+  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY || null });
+});
+
+// Enregistre ou met à jour un abonnement push
+app.post('/api/push/subscribe', httpRateLimit(10), express.json(), async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) { res.status(401).json({ error: 'Auth required' }); return; }
+  const token = authHeader.replace('Bearer ', '');
+  const { data: { user }, error: authErr } = await supa.auth.getUser(token);
+  if (authErr || !user) { res.status(403).json({ error: 'Unauthorized' }); return; }
+
+  const { subscription } = req.body;
+  if (!subscription?.endpoint) { res.status(400).json({ error: 'Invalid subscription' }); return; }
+
+  try {
+    await supaAdmin.from('push_subscriptions').upsert({
+      user_id: user.id,
+      subscription,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_id' });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Désabonnement
+app.post('/api/push/unsubscribe', httpRateLimit(10), express.json(), async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) { res.status(401).json({ error: 'Auth required' }); return; }
+  const token = authHeader.replace('Bearer ', '');
+  const { data: { user } } = await supa.auth.getUser(token);
+  if (!user) { res.status(403).json({ error: 'Unauthorized' }); return; }
+  await supaAdmin.from('push_subscriptions').delete().eq('user_id', user.id);
+  res.json({ ok: true });
+});
+
+// ── Envoi du résumé hebdomadaire ──
+async function sendWeeklySummaries() {
+  if (!webpush) { console.log('⚠ Push désactivé — VAPID manquant'); return; }
+  console.log('📬 Envoi du résumé hebdomadaire…');
+
+  // Récupère tous les abonnés
+  const { data: subs, error } = await supaAdmin
+    .from('push_subscriptions')
+    .select('user_id, subscription');
+  if (error || !subs?.length) { console.log('Aucun abonné push.'); return; }
+
+  // Pour chaque utilisateur, récupère ses stats de la semaine
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  let sent = 0, failed = 0;
+
+  await Promise.all(subs.map(async ({ user_id, subscription }) => {
+    // Récupère le profil
+    const { data: profile } = await supaAdmin
+      .from('profiles')
+      .select('username, level, streak, total_games')
+      .eq('id', user_id)
+      .single();
+
+    const username = profile?.username || 'Joueur';
+    const streak   = profile?.streak   || 0;
+    const level    = profile?.level    || 1;
+
+    // Message personnalisé
+    let body = `Tu as joué cette semaine ! Niveau ${level} · Streak actuel : ${streak}🔥`;
+    if (streak >= 7) body = `🔥 Incroyable ${username} ! 7 jours de streak ! Continue comme ça !`;
+    else if (streak === 0) body = `👋 ${username}, tu nous manques ! Reviens jouer, ta série t'attend.`;
+    else if (streak >= 3) body = `⚡ ${streak} jours de suite ! Tu es en feu, ne lâche pas !`;
+
+    const payload = JSON.stringify({
+      title: '🧠 Mind Impact — Résumé de la semaine',
+      body,
+      icon: '/mindimpact_icon.png',
+      badge: '/mindimpact_icon.png',
+      url: 'https://mindimpact.online',
+      tag: 'weekly-summary'
+    });
+
+    try {
+      await webpush.sendNotification(subscription, payload);
+      sent++;
+    } catch(e) {
+      failed++;
+      // Supprime les abonnements expirés (410 = Gone)
+      if (e.statusCode === 410) {
+        await supaAdmin.from('push_subscriptions').delete().eq('user_id', user_id);
+      }
+    }
+  }));
+
+  console.log(`📬 Résumé hebdo envoyé: ${sent} OK, ${failed} échecs`);
+}
+
+// Cron : tous les dimanches à 19h00 (heure UTC, soit 21h FR été)
+if (cron) {
+  cron.schedule('0 19 * * 0', () => {
+    sendWeeklySummaries();
+  });
+  console.log('⏰ Cron résumé hebdo activé (dim. 19h UTC)');
 }
 
 // ══════════════════════════════════════════
