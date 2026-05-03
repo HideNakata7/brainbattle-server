@@ -114,12 +114,10 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
     console.log('💰 Payment confirmed:', product, 'for user', userId);
 
-    // Calculate expiry for subscriptions
+    // Mind Pass : 30 jours d'accès à partir du paiement
     let expiresAt = null;
     if (product === 'pass_monthly') {
       expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-    } else if (product === 'pass_yearly') {
-      expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
     }
 
     // Store in Supabase (with idempotency check)
@@ -330,7 +328,8 @@ app.post('/api/profile/claim-level-rewards', httpRateLimit(60), async (req, res)
 // Le serveur vérifie le daily cap, débite, et renvoie le nouveau total + level.
 // pass_daily_xp en BDD : JSONB { "YYYY-MM-DD": xp_credited_today }
 //
-const PASS_DAILY_CAP = 1000;       // identique au client
+// 50 niveaux × 1000 XP = 50 000 XP à gagner en 30 jours → ~1700/jour
+const PASS_DAILY_CAP = 1700;
 const PASS_XP_PER_LEVEL = 1000;
 const PASS_TOTAL_LEVELS = 50;
 
@@ -419,16 +418,33 @@ setInterval(() => {
   for (const [k, v] of answerSessions) if (v.expires < now) answerSessions.delete(k);
 }, 600000); // cleanup toutes les 10 min
 
+// Cache in-memory pour /api/check-answer
+// → Élimine les appels Supabase répétitifs sur les questions populaires + l'auth getUser
+const questionAnswerCache = new Map(); // questionId → { correctIndex, answers, expires }
+const authTokenCache = new Map();      // token → { userId, expires }
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of questionAnswerCache) if (v.expires < now) questionAnswerCache.delete(k);
+  for (const [k, v] of authTokenCache)      if (v.expires < now) authTokenCache.delete(k);
+}, 600000); // cleanup toutes les 10 min
+
 app.post('/api/check-answer', httpRateLimit(120), async (req, res) => {
   try {
-    // Auth optionnelle : seul les users connectés ont anti-retry tracké.
-    // (Les anon n'ont pas de records de toute façon → pas d'enjeu compétitif)
+    // Auth optionnelle : on cache le résultat (évite appel auth.getUser à chaque fois)
     let userId = null;
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.replace('Bearer ', '');
-      const { data: { user } } = await supa.auth.getUser(token);
-      if (user) userId = user.id;
+      const cached = authTokenCache.get(token);
+      if (cached && cached.expires > Date.now()) {
+        userId = cached.userId;
+      } else {
+        const { data: { user } } = await supa.auth.getUser(token);
+        if (user) {
+          userId = user.id;
+          authTokenCache.set(token, { userId, expires: Date.now() + 1800000 }); // 30 min
+        }
+      }
     }
 
     const { questionId, userAnswer } = req.body || {};
@@ -446,16 +462,25 @@ app.post('/api/check-answer', httpRateLimit(120), async (req, res) => {
       }
     }
 
-    // Lookup question
-    const { data: q, error: qErr } = await supa.from('translated_questions')
-      .select('correct_index, answers_fr').eq('id', questionId).single();
-    if (qErr || !q) { res.status(404).json({ error: 'question_not_found' }); return; }
-
-    let answers = q.answers_fr;
-    if (typeof answers === 'string') { try { answers = JSON.parse(answers); } catch(e) {} }
-    if (!Array.isArray(answers)) { res.status(500).json({ error: 'bad_question_data' }); return; }
-
-    const correctIndex = q.correct_index;
+    // Lookup question — d'abord en cache, puis Supabase si miss
+    let correctIndex, answers;
+    const qCached = questionAnswerCache.get(questionId);
+    if (qCached && qCached.expires > Date.now()) {
+      correctIndex = qCached.correctIndex;
+      answers = qCached.answers;
+    } else {
+      const { data: q, error: qErr } = await supa.from('translated_questions')
+        .select('correct_index, answers_fr').eq('id', questionId).single();
+      if (qErr || !q) { res.status(404).json({ error: 'question_not_found' }); return; }
+      answers = q.answers_fr;
+      if (typeof answers === 'string') { try { answers = JSON.parse(answers); } catch(e) {} }
+      if (!Array.isArray(answers)) { res.status(500).json({ error: 'bad_question_data' }); return; }
+      correctIndex = q.correct_index;
+      questionAnswerCache.set(questionId, {
+        correctIndex, answers,
+        expires: Date.now() + 3600000 // 1h
+      });
+    }
     let correct = false;
 
     if (typeof userAnswer === 'number') {
@@ -593,9 +618,8 @@ app.get('/api/admin/cheat-flagged', async (req, res) => {
 
 // ── STRIPE PRODUCTS ──
 const STRIPE_PRODUCTS = {
-  // Abonnements
-  pass_monthly:           { name: 'Mind Impact Pass Mensuel',    price: 299,  mode: 'subscription', interval: 'month' },
-  pass_yearly:            { name: 'Mind Impact Pass Annuel',     price: 1999, mode: 'subscription', interval: 'year'  },
+  // Mind Pass : achat unique, valable 30 jours (1 saison)
+  pass_monthly:           { name: 'Mind Impact Pass — 30 jours', price: 299,  mode: 'payment' },
   // Avatars exclusifs boutique
   avatar_shadow_samurai:  { name: 'Avatar Samouraï des Ombres',  price: 99,   mode: 'payment' },
   avatar_twilight_assassin:{ name: 'Avatar Assassin du Crépuscule', price: 99, mode: 'payment' },
@@ -1199,6 +1223,9 @@ io.on('connection', (socket) => {
   // ── TACTICAL EVENTS ──
   registerTacticalEvents(socket, io);
 
+  // ── VOTE CATÉGORIE (matchmaking) ──
+  registerVoteCategoryHandler(socket, io);
+
   // ── MATCHMAKING ──
   socket.on('join_matchmaking', ({ mode, name, avatar, userId, groupCode, elo }) => {
     if (!rateLimitSocket(socket.id, 'join_matchmaking', 10)) return;
@@ -1423,8 +1450,41 @@ function sanitizePlayers(players) {
 //  MATCHMAKING GÉNÉRAL
 // ══════════════════════════════════════════
 
-const mmQueues = { duel1v1:[], royale:[], team:[], tactical:[], chrono:[] };
+const mmQueues = { duel1v1:[], royale:[], team:[], tactical:[], chrono:[], ranked_solo:[], ranked_team:[], ranked_tactical:[] };
 const mmGroups = {};
+
+// Catégories disponibles pour le vote (toutes + option globale)
+const VOTE_CATEGORIES = [
+  { id:'0',   label:'🌍 Toutes catégories' },
+  { id:'9',   label:'✨ Culture générale' },
+  { id:'23',  label:'📖 Histoire' },
+  { id:'22',  label:'🗺️ Géographie' },
+  { id:'17',  label:'🔬 Science & Nature' },
+  { id:'18',  label:'💻 Tech & Informatique' },
+  { id:'19',  label:'🔢 Mathématiques' },
+  { id:'21',  label:'🏆 Sport' },
+  { id:'11',  label:'🎬 Cinéma' },
+  { id:'14',  label:'📺 Séries TV' },
+  { id:'15',  label:'🎮 Jeux vidéo' },
+  { id:'12',  label:'🎵 Musique' },
+  { id:'10',  label:'📚 Livres' },
+  { id:'13',  label:'🎭 Comédies musicales' },
+  { id:'16',  label:'🎲 Jeux de société' },
+  { id:'20',  label:'⚡ Mythologie' },
+  { id:'24',  label:'🏛️ Politique' },
+  { id:'25',  label:'🎨 Art' },
+  { id:'26',  label:'⭐ Célébrités' },
+  { id:'27',  label:'🐾 Animaux' },
+  { id:'28',  label:'🚗 Véhicules' },
+  { id:'29',  label:'💥 Comics' },
+  { id:'30',  label:'📱 Gadgets' },
+  { id:'31',  label:'🇯🇵 Anime & Manga' },
+  { id:'32',  label:'🎠 Dessins animés' },
+  { id:'33',  label:'🍽️ Cuisine & Gastronomie' },
+  { id:'34',  label:'🥖 Culture Française' },
+  { id:'35',  label:'🧩 Logique & Énigmes' },
+  { id:'36',  label:'🧙 Contes & Légendes' },
+];
 
 
 function tryMatchmaking(mode, io) {
@@ -1449,24 +1509,94 @@ function tryMatchmaking(mode, io) {
 
 async function createMatchmadeRoom(playerList, mode, io) {
   const code = genCode();
-  rooms[code] = { code, host:playerList[0].socketId, status:'waiting', mode, category:'0', difficulty:'', maxQ:10, players:{}, questions:[], currentQ:0, timer:null, answers:{}, answerCount:0, teamScores:{A:0,B:0} };
+  rooms[code] = {
+    code, host:playerList[0].socketId, status:'voting', mode,
+    category:'0', difficulty:'', maxQ:10,
+    players:{}, questions:[], currentQ:0, timer:null,
+    answers:{}, answerCount:0, teamScores:{A:0,B:0},
+    categoryVotes:{}, categoryVoteTimer:null
+  };
   playerList.forEach((p,i) => {
     rooms[code].players[p.socketId]={name:p.name,avatar:p.avatar||'🎮',score:0,lives:3,alive:true,team:i<Math.ceil(playerList.length/2)?'A':'B'};
     players[p.socketId]={code,name:p.name};
     const s=io.sockets.sockets.get(p.socketId);
     if(s) s.join(code);
   });
+
   io.to(code).emit('mm_match_found',{roomCode:code,mode,players:playerList.map(p=>({name:p.name,avatar:p.avatar}))});
   console.log(`✅ Match [${mode}]: ${playerList.map(p=>p.name).join(' vs ')} → ${code}`);
-  setTimeout(async()=>{
-    try{
-      rooms[code].questions=await fetchQuestions(10,'0','');
-      rooms[code].status='playing';
-      io.to(code).emit('game_started',{room:sanitizeRoom(rooms[code])});
-      if(mode==='tactical'){ initTacticalRoom(code,rooms[code].players,rooms[code].questions); setTimeout(()=>startTacticalRound(code,io),1500); }
-      else setTimeout(()=>sendQuestion(code),1000);
-    }catch(e){console.error('MM start:',e);}
-  },4000);
+
+  // ── Phase 1 : Vote catégorie (3s après le match trouvé pour laisser le temps d'afficher) ──
+  setTimeout(() => {
+    const room = rooms[code];
+    if (!room) return;
+    io.to(code).emit('category_vote_started', { categories: VOTE_CATEGORIES, duration: 10 });
+
+    // Auto-résolution après 10s
+    room.categoryVoteTimer = setTimeout(() => finalizeCategoryVote(code, io), 10000);
+  }, 3000);
+}
+
+function finalizeCategoryVote(code, io) {
+  const room = rooms[code];
+  if (!room) return;
+  clearTimeout(room.categoryVoteTimer);
+
+  // Comptage des votes
+  const counts = {};
+  VOTE_CATEGORIES.forEach(c => { counts[c.id] = 0; });
+  Object.values(room.categoryVotes).forEach(catId => {
+    counts[catId] = (counts[catId] || 0) + 1;
+  });
+
+  // Gagnant = catégorie avec le plus de votes (égalité → random entre ex-aequo)
+  const maxVotes = Math.max(...Object.values(counts));
+  const winners = Object.keys(counts).filter(id => counts[id] === maxVotes);
+  const chosenId = winners[Math.floor(Math.random() * winners.length)];
+  const chosenLabel = VOTE_CATEGORIES.find(c => c.id === chosenId)?.label || '🌍 Toutes catégories';
+
+  room.category = chosenId;
+  room.status = 'waiting';
+  io.to(code).emit('category_chosen', { categoryId: chosenId, categoryLabel: chosenLabel, votes: counts });
+  console.log(`🗳️ Vote [${code}]: ${chosenLabel} (${JSON.stringify(counts)})`);
+
+  // ── Phase 2 : Démarrage du jeu ──
+  setTimeout(async () => {
+    const r = rooms[code];
+    if (!r) return;
+    try {
+      r.questions = await fetchQuestions(10, r.category, '');
+      r.status = 'playing';
+      io.to(code).emit('game_started', { room: sanitizeRoom(r) });
+      if (r.mode === 'tactical') {
+        initTacticalRoom(code, r.players, r.questions);
+        setTimeout(() => startTacticalRound(code, io), 1500);
+      } else {
+        setTimeout(() => sendQuestion(code), 1000);
+      }
+    } catch(e) { console.error('MM start:', e); }
+  }, 3000);
+}
+
+// Handler vote catégorie (dans io.on('connection', ...) via late registration)
+// Appelé depuis le bloc io.on('connection')
+function registerVoteCategoryHandler(socket, io) {
+  socket.on('vote_category', ({ code, categoryId }) => {
+    const room = rooms[code];
+    if (!room || room.status !== 'voting') return;
+    if (!VOTE_CATEGORIES.find(c => c.id === categoryId)) return;
+    // Un vote par joueur
+    room.categoryVotes[socket.id] = categoryId;
+    // Broadcast état des votes
+    const counts = {};
+    VOTE_CATEGORIES.forEach(c => { counts[c.id] = 0; });
+    Object.values(room.categoryVotes).forEach(id => { counts[id] = (counts[id] || 0) + 1; });
+    io.to(code).emit('category_votes_update', { votes: counts, total: Object.keys(room.players).length, voted: Object.keys(room.categoryVotes).length });
+    // Si tout le monde a voté → finaliser immédiatement
+    if (Object.keys(room.categoryVotes).length >= Object.keys(room.players).length) {
+      finalizeCategoryVote(code, io);
+    }
+  });
 }
 
 // ══════════════════════════════════════════
