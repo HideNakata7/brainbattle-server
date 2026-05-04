@@ -1620,15 +1620,17 @@ function registerVoteCategoryHandler(socket, io) {
 
 // ══════════════════════════════════════════
 //  PARRAINAGE — referral system
+//  Zéro modification de schéma :
+//  • Code = 8 premiers chars de l'UUID (sans tirets, uppercase)
+//  • Recherche referrer via LIKE sur id
+//  • Statut "déjà parrainé" → user_metadata.referred_by (auth API)
 // ══════════════════════════════════════════
 
-// Génère un code de parrainage déterministe depuis l'UUID
 function genReferralCode(userId) {
   return userId.replace(/-/g, '').substring(0, 8).toUpperCase();
 }
 
 // POST /api/apply-referral
-// Body: { referral_code: string }   Header: Authorization: Bearer <jwt>
 app.post('/api/apply-referral', httpRateLimit(5), express.json(), async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) { return res.status(401).json({ error: 'Auth required' }); }
@@ -1637,34 +1639,46 @@ app.post('/api/apply-referral', httpRateLimit(5), express.json(), async (req, re
   if (authErr || !user) { return res.status(403).json({ error: 'Unauthorized' }); }
 
   const { referral_code } = req.body;
-  if (!referral_code || typeof referral_code !== 'string') { return res.status(400).json({ error: 'Invalid code' }); }
+  if (!referral_code || typeof referral_code !== 'string' || referral_code.length < 6) {
+    return res.status(400).json({ error: 'Code invalide' });
+  }
 
   try {
-    // Find referrer profile by code
     const code = referral_code.toUpperCase().trim();
-    const { data: referrer, error: refErr } = await supaAdmin
+
+    // Vérifie que l'utilisateur n'a pas déjà été parrainé (via user_metadata)
+    const { data: { user: fullUser } } = await supaAdmin.auth.admin.getUserById(user.id);
+    if (fullUser?.user_metadata?.referred_by) {
+      return res.status(400).json({ error: 'Parrainage déjà appliqué' });
+    }
+
+    // Trouve le referrer en cherchant par préfixe d'UUID
+    // Code = 8 premiers chars sans tirets → UUID commence par "xxxx-xxxx-..."
+    // ex: code ABCD1234 → id LIKE 'abcd1234-%'
+    const uuidPrefix = (code.slice(0,8).toLowerCase() + '-').padEnd(9, '%');
+    const { data: referrers } = await supaAdmin
       .from('profiles')
       .select('id, username, xp')
-      .eq('referral_code', code)
-      .single();
+      .ilike('id', uuidPrefix + '%')
+      .limit(1);
 
-    if (refErr || !referrer) { return res.status(404).json({ error: 'Code invalide' }); }
+    const referrer = referrers?.[0];
+    if (!referrer) { return res.status(404).json({ error: 'Code invalide ou introuvable' }); }
     if (referrer.id === user.id) { return res.status(400).json({ error: 'Tu ne peux pas te parrainer toi-même' }); }
-
-    // Check that user hasn't already been referred
-    const { data: newProfile } = await supaAdmin.from('profiles').select('referred_by, xp').eq('id', user.id).single();
-    if (!newProfile) { return res.status(404).json({ error: 'Profil introuvable' }); }
-    if (newProfile.referred_by) { return res.status(400).json({ error: 'Parrainage déjà appliqué' }); }
 
     const XP_REWARD = 500;
 
-    // Award XP to both + mark referred_by
+    // XP du nouveau joueur
+    const { data: newProfile } = await supaAdmin.from('profiles').select('xp').eq('id', user.id).single();
+
+    // Applique en parallèle : XP aux deux + marquage user_metadata
     await Promise.all([
-      supaAdmin.from('profiles').update({ xp: (newProfile.xp || 0) + XP_REWARD, referred_by: referrer.id }).eq('id', user.id),
-      supaAdmin.from('profiles').update({ xp: (referrer.xp || 0) + XP_REWARD }).eq('id', referrer.id)
+      supaAdmin.from('profiles').update({ xp: (newProfile?.xp || 0) + XP_REWARD }).eq('id', user.id),
+      supaAdmin.from('profiles').update({ xp: (referrer.xp || 0) + XP_REWARD }).eq('id', referrer.id),
+      supaAdmin.auth.admin.updateUserById(user.id, { user_metadata: { referred_by: referrer.id } })
     ]);
 
-    console.log(`✅ Parrainage : ${user.id} parrainé par ${referrer.username} (${referrer.id}) — +${XP_REWARD} XP chacun`);
+    console.log(`✅ Parrainage : ${user.id} parrainé par ${referrer.username} — +${XP_REWARD} XP chacun`);
     return res.json({ success: true, referrer: referrer.username, xp: XP_REWARD });
   } catch(e) {
     console.error('apply-referral error:', e.message);
@@ -1672,22 +1686,14 @@ app.post('/api/apply-referral', httpRateLimit(5), express.json(), async (req, re
   }
 });
 
-// GET /api/referral-code  — génère/retourne le code de parrainage de l'utilisateur
+// GET /api/referral-code
 app.get('/api/referral-code', httpRateLimit(20), async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) { return res.status(401).json({ error: 'Auth required' }); }
   const token = authHeader.replace('Bearer ', '');
   const { data: { user }, error: authErr } = await supa.auth.getUser(token);
   if (authErr || !user) { return res.status(403).json({ error: 'Unauthorized' }); }
-
   const code = genReferralCode(user.id);
-
-  // Ensure referral_code is set in DB
-  const { data: profile } = await supaAdmin.from('profiles').select('referral_code').eq('id', user.id).single();
-  if (profile && !profile.referral_code) {
-    await supaAdmin.from('profiles').update({ referral_code: code }).eq('id', user.id);
-  }
-
   return res.json({ code, url: 'https://mindimpact.online?ref=' + code });
 });
 
