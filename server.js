@@ -142,12 +142,12 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     // Store in Supabase (with idempotency check)
     try {
       // Check if this session was already processed
-      const { data: existing } = await supa.from('purchases').select('id').eq('stripe_session_id', session.id);
+      const { data: existing } = await supaAdmin.from('purchases').select('id').eq('stripe_session_id', session.id);
       if (existing && existing.length > 0) {
         console.log('⚠️ Webhook already processed for session:', session.id);
         res.json({ received: true }); return;
       }
-      const { error } = await supa.from('purchases').insert({
+      const { error } = await supaAdmin.from('purchases').insert({
         user_id: userId,
         product: product,
         stripe_session_id: session.id,
@@ -726,7 +726,7 @@ app.post('/create-checkout-session', httpRateLimit(10), async (req, res) => {
     if (!prod) { res.status(400).json({ error: 'Product not found' }); return; }
 
     // Validate redirect URLs (prevent open redirect)
-    const allowedDomains = ['mindimpact.online', 'brainbattle-client.vercel.app', 'localhost'];
+    const allowedDomains = ['mindimpact.online', 'brainbattle.fr', 'brainbattle-client.vercel.app', 'localhost'];
     const isValidUrl = (url) => { try { const u = new URL(url); return allowedDomains.some(d => u.hostname.includes(d)); } catch { return false; } };
     if (!isValidUrl(successUrl) || !isValidUrl(cancelUrl)) { res.status(400).json({ error: 'Invalid redirect URL' }); return; }
 
