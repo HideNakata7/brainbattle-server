@@ -167,6 +167,73 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 app.use(express.json());
 app.get('/', (req, res) => res.send('Mind Impact Server ✅'));
 
+// ══════════════════════════════════════════
+//  VERIFY SESSION — appelé par le client après retour Stripe
+//  Stripe ajoute {CHECKOUT_SESSION_ID} dans l'URL de succès
+//  → plus fiable que le webhook seul (fonctionne même sans webhook)
+// ══════════════════════════════════════════
+app.post('/api/verify-session', httpRateLimit(10), express.json(), async (req, res) => {
+  if (!stripe) { return res.status(500).json({ error: 'Stripe not configured' }); }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) { return res.status(401).json({ error: 'Auth required' }); }
+  const token = authHeader.replace('Bearer ', '');
+  const { data: { user }, error: authErr } = await supa.auth.getUser(token);
+  if (authErr || !user) { return res.status(403).json({ error: 'Unauthorized' }); }
+
+  const { session_id } = req.body;
+  if (!session_id || typeof session_id !== 'string') { return res.status(400).json({ error: 'Missing session_id' }); }
+
+  try {
+    // Récupère la session Stripe pour vérifier le paiement
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+
+    if (session.payment_status !== 'paid') {
+      return res.status(400).json({ error: 'Payment not completed', status: session.payment_status });
+    }
+
+    const { userId, product } = session.metadata || {};
+    if (!userId || !product) { return res.status(400).json({ error: 'Missing metadata' }); }
+
+    // Sécurité : vérifie que le token correspond bien à l'userId de la session
+    if (user.id !== userId) { return res.status(403).json({ error: 'User mismatch' }); }
+
+    // Idempotence : ne pas doubler les achats
+    const { data: existing } = await supaAdmin.from('purchases')
+      .select('id').eq('stripe_session_id', session_id).limit(1);
+    if (existing && existing.length > 0) {
+      console.log('✅ Session déjà enregistrée:', session_id);
+      return res.json({ success: true, product, already: true });
+    }
+
+    // Calcule l'expiration
+    let expiresAt = null;
+    if (product === 'pass_monthly') {
+      expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    }
+
+    // Enregistre l'achat
+    const { error: insertErr } = await supaAdmin.from('purchases').insert({
+      user_id: userId,
+      product,
+      stripe_session_id: session_id,
+      status: 'completed',
+      expires_at: expiresAt,
+    });
+
+    if (insertErr) {
+      console.error('❌ Insert purchase error:', insertErr.message);
+      return res.status(500).json({ error: insertErr.message });
+    }
+
+    console.log(`✅ Achat vérifié et enregistré : ${product} pour ${userId}`);
+    return res.json({ success: true, product, expiresAt });
+  } catch(e) {
+    console.error('verify-session error:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // ── VERIFY PURCHASES (with auth token) ──
 app.get('/api/purchases/:userId', httpRateLimit(30), async (req, res) => {
   try {
